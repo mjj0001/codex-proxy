@@ -1,6 +1,5 @@
 # Codex Proxy
-
-独立的 Codex API 代理服务，提供 OpenAI 兼容接口，支持多账号轮询和自动 Token 刷新。
+ Codex API 代理服务，提供 OpenAI 兼容接口，支持多账号轮询和自动 Token 刷新。
 
 ## 功能
 

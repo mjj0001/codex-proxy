@@ -28,10 +28,11 @@ import (
  * @field maxRetry - 请求失败最大重试次数（切换账号重试）
  */
 type ProxyHandler struct {
-	manager  *auth.Manager
-	executor *executor.Executor
-	apiKeys  []string
-	maxRetry int
+	manager      *auth.Manager
+	executor     *executor.Executor
+	apiKeys      []string
+	maxRetry     int
+	quotaChecker *auth.QuotaChecker
 }
 
 /**
@@ -42,15 +43,16 @@ type ProxyHandler struct {
  * @param maxRetry - 最大重试次数（0 表示不重试）
  * @returns *ProxyHandler - 代理处理器实例
  */
-func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []string, maxRetry int) *ProxyHandler {
+func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []string, maxRetry int, proxyURL string) *ProxyHandler {
 	if maxRetry < 0 {
 		maxRetry = 0
 	}
 	return &ProxyHandler{
-		manager:  manager,
-		executor: exec,
-		apiKeys:  apiKeys,
-		maxRetry: maxRetry,
+		manager:      manager,
+		executor:     exec,
+		apiKeys:      apiKeys,
+		maxRetry:     maxRetry,
+		quotaChecker: auth.NewQuotaChecker(proxyURL, 50),
 	}
 }
 
@@ -78,6 +80,7 @@ func (h *ProxyHandler) RegisterRoutes(r *gin.Engine) {
 	}
 	mgmt.GET("/stats", h.handleStats)
 	mgmt.POST("/refresh", h.handleRefresh)
+	mgmt.POST("/check-quota", h.handleCheckQuota)
 }
 
 /**
@@ -341,16 +344,48 @@ func (h *ProxyHandler) handleStats(c *gin.Context) {
 }
 
 /**
- * handleRefresh 手动刷新所有账号的 Token 和额度状态
- * 强制刷新所有 Token（跳过过期检查），同时重置冷却/禁用状态
+ * handleRefresh 手动刷新所有账号的 Token（SSE 流式返回进度）
+ * 每刷新完一个账号就推送一条 SSE 事件，防止大量账号时超时
  * POST /refresh
  */
 func (h *ProxyHandler) handleRefresh(c *gin.Context) {
-	result := h.manager.ForceRefreshAll(c.Request.Context())
-	c.JSON(http.StatusOK, gin.H{
-		"message": "刷新完成",
-		"result":  result,
-	})
+	ch := h.manager.ForceRefreshAllStream(c.Request.Context(), h.quotaChecker)
+	writeSSEProgress(c, ch)
+}
+
+/**
+ * handleCheckQuota 查询所有账号的剩余额度（SSE 流式返回进度）
+ * 每查询完一个账号就推送一条 SSE 事件，防止大量账号时超时
+ * POST /check-quota
+ */
+func (h *ProxyHandler) handleCheckQuota(c *gin.Context) {
+	ch := h.quotaChecker.CheckAllStream(c.Request.Context(), h.manager)
+	writeSSEProgress(c, ch)
+}
+
+/**
+ * writeSSEProgress 将 ProgressEvent channel 以 SSE 格式写入 HTTP 响应
+ * @param c - Gin 上下文
+ * @param ch - 进度事件 channel
+ */
+func writeSSEProgress(c *gin.Context, ch <-chan auth.ProgressEvent) {
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Status(http.StatusOK)
+
+	flusher, canFlush := c.Writer.(http.Flusher)
+
+	for event := range ch {
+		data, err := json.Marshal(event)
+		if err != nil {
+			continue
+		}
+		_, _ = fmt.Fprintf(c.Writer, "event: %s\ndata: %s\n\n", event.Type, data)
+		if canFlush {
+			flusher.Flush()
+		}
+	}
 }
 
 /**

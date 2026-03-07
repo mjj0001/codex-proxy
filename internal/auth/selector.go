@@ -54,8 +54,23 @@ func (s *RoundRobinSelector) Pick(model string, accounts []*Account) (*Account, 
 		return nil, fmt.Errorf("没有可用的 Codex 账号")
 	}
 
-	/* 按文件路径排序，确保稳定的轮询顺序 */
+	/*
+	 * 按额度使用率升序排序（剩余额度最多的优先）
+	 * used_percent: 0=最空闲, 100=已满, -1=未知（排最后）
+	 * 同使用率时按文件路径保持稳定顺序
+	 */
 	sort.Slice(available, func(i, j int) bool {
+		pi := available[i].GetUsedPercent()
+		pj := available[j].GetUsedPercent()
+		if pi < 0 && pj >= 0 {
+			return false
+		}
+		if pi >= 0 && pj < 0 {
+			return true
+		}
+		if pi != pj {
+			return pi < pj
+		}
 		return available[i].FilePath < available[j].FilePath
 	})
 
@@ -65,7 +80,6 @@ func (s *RoundRobinSelector) Pick(model string, accounts []*Account) (*Account, 
 	key := "codex:" + model
 	index := s.cursors[key]
 
-	/* 防止整数溢出 */
 	if index >= 2_147_483_640 {
 		index = 0
 	}

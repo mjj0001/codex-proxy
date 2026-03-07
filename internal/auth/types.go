@@ -5,9 +5,12 @@
 package auth
 
 import (
+	"encoding/json"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/tidwall/gjson"
 )
 
 /**
@@ -83,6 +86,12 @@ type Account struct {
 	DisableReason       string
 	QuotaResetsAt       time.Time
 	QuotaExhausted      bool
+	TotalInputTokens    atomic.Int64
+	TotalOutputTokens   atomic.Int64
+	TotalTokens         atomic.Int64
+	TotalCompletions    atomic.Int64
+	QuotaInfo           *QuotaInfo
+	QuotaCheckedAt      time.Time
 }
 
 /**
@@ -121,20 +130,48 @@ const (
  * @field CooldownUntil - 冷却结束时间
  */
 type AccountStats struct {
-	Email               string    `json:"email"`
-	FilePath            string    `json:"file_path"`
-	Status              string    `json:"status"`
-	PlanType            string    `json:"plan_type,omitempty"`
-	DisableReason       string    `json:"disable_reason,omitempty"`
-	TotalRequests       int64     `json:"total_requests"`
-	TotalErrors         int64     `json:"total_errors"`
-	ConsecutiveFailures int       `json:"consecutive_failures"`
-	LastUsedAt          time.Time `json:"last_used_at,omitempty"`
-	LastRefreshedAt     time.Time `json:"last_refreshed_at,omitempty"`
-	CooldownUntil       time.Time `json:"cooldown_until,omitempty"`
-	QuotaExhausted      bool      `json:"quota_exhausted"`
-	QuotaResetsAt       time.Time `json:"quota_resets_at,omitempty"`
-	TokenExpire         string    `json:"token_expire,omitempty"`
+	Email               string     `json:"email"`
+	FilePath            string     `json:"file_path"`
+	Status              string     `json:"status"`
+	PlanType            string     `json:"plan_type,omitempty"`
+	DisableReason       string     `json:"disable_reason,omitempty"`
+	TotalRequests       int64      `json:"total_requests"`
+	TotalErrors         int64      `json:"total_errors"`
+	ConsecutiveFailures int        `json:"consecutive_failures"`
+	LastUsedAt          time.Time  `json:"last_used_at,omitempty"`
+	LastRefreshedAt     time.Time  `json:"last_refreshed_at,omitempty"`
+	CooldownUntil       time.Time  `json:"cooldown_until,omitempty"`
+	QuotaExhausted      bool       `json:"quota_exhausted"`
+	QuotaResetsAt       time.Time  `json:"quota_resets_at,omitempty"`
+	TokenExpire         string     `json:"token_expire,omitempty"`
+	Usage               UsageStats `json:"usage"`
+	Quota               *QuotaInfo `json:"quota,omitempty"`
+}
+
+/**
+ * UsageStats token 使用量统计
+ * @field TotalCompletions - 总补全次数
+ * @field InputTokens - 输入 token 总量
+ * @field OutputTokens - 输出 token 总量
+ * @field TotalTokens - token 总量
+ */
+type UsageStats struct {
+	TotalCompletions int64 `json:"total_completions"`
+	InputTokens      int64 `json:"input_tokens"`
+	OutputTokens     int64 `json:"output_tokens"`
+	TotalTokens      int64 `json:"total_tokens"`
+}
+
+/**
+ * QuotaInfo 账号额度信息（来自 wham/usage API）
+ * @field Valid - 账号是否有效（API 返回 200）
+ * @field RawJSON - 原始响应 JSON（透传展示）
+ */
+type QuotaInfo struct {
+	Valid      bool            `json:"valid"`
+	StatusCode int             `json:"status_code"`
+	RawData    json.RawMessage `json:"raw_data,omitempty"`
+	CheckedAt  time.Time       `json:"checked_at"`
 }
 
 /**
@@ -271,6 +308,53 @@ func (a *Account) RecordSuccess() {
 }
 
 /**
+ * RecordUsage 记录一次请求的 token 使用量
+ * @param inputTokens - 输入 token 数
+ * @param outputTokens - 输出 token 数
+ * @param totalTokens - 总 token 数
+ */
+func (a *Account) RecordUsage(inputTokens, outputTokens, totalTokens int64) {
+	a.TotalCompletions.Add(1)
+	if inputTokens > 0 {
+		a.TotalInputTokens.Add(inputTokens)
+	}
+	if outputTokens > 0 {
+		a.TotalOutputTokens.Add(outputTokens)
+	}
+	if totalTokens > 0 {
+		a.TotalTokens.Add(totalTokens)
+	} else if inputTokens+outputTokens > 0 {
+		a.TotalTokens.Add(inputTokens + outputTokens)
+	}
+}
+
+/**
+ * GetUsedPercent 获取账号的额度使用率百分比
+ * 从 QuotaInfo.RawData 中提取 rate_limit.primary_window.used_percent
+ * 未查询过额度的账号返回 -1（排到最后）
+ * 配额耗尽的账号返回 100
+ * @returns float64 - 使用率（0-100），-1 表示未知
+ */
+func (a *Account) GetUsedPercent() float64 {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	if a.QuotaExhausted {
+		return 100
+	}
+	if a.QuotaInfo == nil || !a.QuotaInfo.Valid || len(a.QuotaInfo.RawData) == 0 {
+		return -1
+	}
+
+	/* 从 raw_data 中解析 used_percent */
+	result := gjson.GetBytes(a.QuotaInfo.RawData, "rate_limit.primary_window.used_percent")
+	if !result.Exists() {
+		return -1
+	}
+	return result.Float()
+}
+
+/**
  * RecordFailure 记录一次失败请求
  * @returns int - 当前连续失败次数
  */
@@ -323,5 +407,12 @@ func (a *Account) GetStats() AccountStats {
 		QuotaExhausted:      quotaExhausted,
 		QuotaResetsAt:       quotaResetsAt,
 		TokenExpire:         a.Token.Expire,
+		Usage: UsageStats{
+			TotalCompletions: a.TotalCompletions.Load(),
+			InputTokens:      a.TotalInputTokens.Load(),
+			OutputTokens:     a.TotalOutputTokens.Load(),
+			TotalTokens:      a.TotalTokens.Load(),
+		},
+		Quota: a.QuotaInfo,
 	}
 }

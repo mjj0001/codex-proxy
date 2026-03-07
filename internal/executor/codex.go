@@ -158,6 +158,8 @@ func (e *Executor) ExecuteStream(ctx context.Context, account *auth.Account, req
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
+		/* 提取流式 usage */
+		extractUsageFromStreamLine(line, account)
 		chunks := translator.ConvertStreamChunk(ctx, line, state, reverseToolMap)
 		for _, chunk := range chunks {
 			_, _ = fmt.Fprintf(writer, "data: %s\n\n", chunk)
@@ -238,6 +240,9 @@ func (e *Executor) ExecuteNonStream(ctx context.Context, account *auth.Account, 
 	if err != nil {
 		return nil, fmt.Errorf("读取响应失败: %w", err)
 	}
+
+	/* 提取 usage 统计 */
+	extractUsageFromSSE(data, account)
 
 	/* 从 SSE 数据中找到 response.completed 事件并转换 */
 	reverseToolMap := translator.BuildReverseToolNameMap(requestBody)
@@ -326,6 +331,8 @@ func (e *Executor) ExecuteResponsesStream(ctx context.Context, account *auth.Acc
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
+		/* 提取流式 usage */
+		extractUsageFromStreamLine(line, account)
 		if len(line) == 0 {
 			_, _ = fmt.Fprint(writer, "\n")
 		} else {
@@ -400,6 +407,9 @@ func (e *Executor) ExecuteResponsesNonStream(ctx context.Context, account *auth.
 	if err != nil {
 		return nil, fmt.Errorf("读取响应失败: %w", err)
 	}
+
+	/* 提取 usage 统计 */
+	extractUsageFromSSE(data, account)
 
 	/* 从 SSE 数据中找到 response.completed 事件，提取 response 对象 */
 	lines := bytes.Split(data, []byte("\n"))
@@ -541,4 +551,55 @@ func parseRetryAfter(body []byte) time.Duration {
 
 	/* 默认冷却 60 秒 */
 	return 60 * time.Second
+}
+
+/**
+ * extractUsageFromSSE 从 SSE 数据中提取 response.completed 事件的 usage 信息
+ * 并记录到账号的 token 使用量统计
+ * @param data - 完整的 SSE 响应数据
+ * @param account - 要记录 usage 的账号
+ */
+func extractUsageFromSSE(data []byte, account *auth.Account) {
+	lines := bytes.Split(data, []byte("\n"))
+	for _, line := range lines {
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		jsonData := bytes.TrimSpace(line[5:])
+		if gjson.GetBytes(jsonData, "type").String() != "response.completed" {
+			continue
+		}
+		usage := gjson.GetBytes(jsonData, "response.usage")
+		if !usage.Exists() {
+			continue
+		}
+		inputTokens := usage.Get("input_tokens").Int()
+		outputTokens := usage.Get("output_tokens").Int()
+		totalTokens := usage.Get("total_tokens").Int()
+		account.RecordUsage(inputTokens, outputTokens, totalTokens)
+		return
+	}
+}
+
+/**
+ * extractUsageFromStreamLine 从单行 SSE 数据中提取 usage（用于流式场景）
+ * @param line - 单行 SSE 数据
+ * @param account - 要记录 usage 的账号
+ */
+func extractUsageFromStreamLine(line []byte, account *auth.Account) {
+	if !bytes.HasPrefix(line, []byte("data:")) {
+		return
+	}
+	jsonData := bytes.TrimSpace(line[5:])
+	if gjson.GetBytes(jsonData, "type").String() != "response.completed" {
+		return
+	}
+	usage := gjson.GetBytes(jsonData, "response.usage")
+	if !usage.Exists() {
+		return
+	}
+	inputTokens := usage.Get("input_tokens").Int()
+	outputTokens := usage.Get("output_tokens").Int()
+	totalTokens := usage.Get("total_tokens").Int()
+	account.RecordUsage(inputTokens, outputTokens, totalTokens)
 }

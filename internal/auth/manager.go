@@ -1,8 +1,3 @@
-/**
- * 账号管理器模块
- * 负责从磁盘加载账号文件、定时刷新 Token、保存更新后的 Token
- * 支持热加载新增账号文件、并发刷新（支持 2w+ 账号）、线程安全的账号访问和轮询选择
- */
 package auth
 
 import (
@@ -416,89 +411,125 @@ func (m *Manager) refreshAllAccountsConcurrent(ctx context.Context) {
 }
 
 /**
- * RefreshResult 手动刷新操作的统计结果
- * @field Total - 总账号数
- * @field Success - 刷新成功数
- * @field Failed - 刷新失败数（已从号池移除）
- * @field Remaining - 刷新后剩余可用账号数
- * @field Duration - 操作耗时
+ * ProgressEvent SSE 流式进度事件
+ * @field Type - 事件类型：item（单条进度）/ done（完成汇总）
+ * @field Email - 账号邮箱（item 类型时有值）
+ * @field Success - 该条操作是否成功（item 类型时有值）
+ * @field Message - 描述信息
+ * @field Total - 总数（done 类型时有值）
+ * @field SuccessCount - 成功数（done 类型时有值）
+ * @field FailedCount - 失败数（done 类型时有值）
+ * @field Remaining - 剩余数（done 类型时有值）
+ * @field Duration - 耗时（done 类型时有值）
+ * @field Current - 当前进度序号
  */
-type RefreshResult struct {
-	Total     int    `json:"total"`
-	Success   int    `json:"success"`
-	Failed    int    `json:"failed"`
-	Remaining int    `json:"remaining"`
-	Duration  string `json:"duration"`
+type ProgressEvent struct {
+	Type         string `json:"type"`
+	Email        string `json:"email,omitempty"`
+	Success      *bool  `json:"success,omitempty"`
+	Message      string `json:"message,omitempty"`
+	Total        int    `json:"total,omitempty"`
+	SuccessCount int    `json:"success_count,omitempty"`
+	FailedCount  int    `json:"failed_count,omitempty"`
+	Remaining    int    `json:"remaining,omitempty"`
+	Duration     string `json:"duration,omitempty"`
+	Current      int    `json:"current,omitempty"`
 }
 
 /**
- * ForceRefreshAll 强制刷新所有账号的 Token（跳过过期时间检查）
- * 用于管理接口手动触发刷新，同时重置所有冷却状态
+ * ForceRefreshAllStream 强制刷新所有账号的 Token（SSE 流式返回进度）
+ * 每刷新完一个账号就通过 channel 发送一个 ProgressEvent
  * @param ctx - 上下文
- * @returns *RefreshResult - 刷新统计结果
+ * @returns <-chan ProgressEvent - 进度事件 channel
  */
-func (m *Manager) ForceRefreshAll(ctx context.Context) *RefreshResult {
-	m.mu.RLock()
-	accounts := make([]*Account, len(m.accounts))
-	copy(accounts, m.accounts)
-	m.mu.RUnlock()
+func (m *Manager) ForceRefreshAllStream(ctx context.Context, quotaChecker *QuotaChecker) <-chan ProgressEvent {
+	ch := make(chan ProgressEvent, 100)
 
-	total := len(accounts)
-	if total == 0 {
-		return &RefreshResult{Duration: "0s"}
-	}
+	go func() {
+		defer close(ch)
 
-	start := time.Now()
-	log.Infof("开始手动强制刷新 %d 个账号（并发 %d）", total, m.refreshConcurrency)
+		m.mu.RLock()
+		accounts := make([]*Account, len(m.accounts))
+		copy(accounts, m.accounts)
+		m.mu.RUnlock()
 
-	/* 先重置所有冷却/禁用状态 */
-	for _, acc := range accounts {
-		acc.SetActive()
-	}
-
-	sem := make(chan struct{}, m.refreshConcurrency)
-	var wg sync.WaitGroup
-	var successCount, failCount int64
-	var mu sync.Mutex
-
-	for _, acc := range accounts {
-		if ctx.Err() != nil {
-			break
+		total := len(accounts)
+		if total == 0 {
+			ch <- ProgressEvent{Type: "done", Message: "无账号", Duration: "0s"}
+			return
 		}
 
-		wg.Add(1)
-		sem <- struct{}{}
+		start := time.Now()
+		log.Infof("开始手动强制刷新 %d 个账号（并发 %d）", total, m.refreshConcurrency)
 
-		go func(a *Account) {
-			defer wg.Done()
-			defer func() { <-sem }()
+		for _, acc := range accounts {
+			acc.SetActive()
+		}
 
-			if m.forceRefreshAccount(ctx, a) {
-				mu.Lock()
-				successCount++
-				mu.Unlock()
-			} else {
-				mu.Lock()
-				failCount++
-				mu.Unlock()
+		sem := make(chan struct{}, m.refreshConcurrency)
+		var wg sync.WaitGroup
+		var successCount, failCount, current int64
+		var mu sync.Mutex
+
+		for _, acc := range accounts {
+			if ctx.Err() != nil {
+				break
 			}
-		}(acc)
-	}
 
-	wg.Wait()
+			wg.Add(1)
+			sem <- struct{}{}
 
-	remaining := m.AccountCount()
-	elapsed := time.Since(start).Round(time.Millisecond)
-	log.Infof("手动刷新完成: 成功 %d, 失败 %d, 耗时 %v, 剩余 %d 个",
-		successCount, failCount, elapsed, remaining)
+			go func(a *Account) {
+				defer wg.Done()
+				defer func() { <-sem }()
 
-	return &RefreshResult{
-		Total:     total,
-		Success:   int(successCount),
-		Failed:    int(failCount),
-		Remaining: remaining,
-		Duration:  elapsed.String(),
-	}
+				ok := m.forceRefreshAccount(ctx, a)
+
+				/* 刷新成功后同时查询额度 */
+				if ok && quotaChecker != nil {
+					quotaChecker.CheckOne(ctx, a)
+				}
+
+				email := a.GetEmail()
+				mu.Lock()
+				current++
+				cur := int(current)
+				if ok {
+					successCount++
+				} else {
+					failCount++
+				}
+				mu.Unlock()
+
+				ch <- ProgressEvent{
+					Type:    "item",
+					Email:   email,
+					Success: &ok,
+					Current: cur,
+					Total:   total,
+				}
+			}(acc)
+		}
+
+		wg.Wait()
+
+		remaining := m.AccountCount()
+		elapsed := time.Since(start).Round(time.Millisecond)
+		log.Infof("手动刷新完成: 成功 %d, 失败 %d, 耗时 %v, 剩余 %d 个",
+			successCount, failCount, elapsed, remaining)
+
+		ch <- ProgressEvent{
+			Type:         "done",
+			Message:      "刷新完成",
+			Total:        total,
+			SuccessCount: int(successCount),
+			FailedCount:  int(failCount),
+			Remaining:    remaining,
+			Duration:     elapsed.String(),
+		}
+	}()
+
+	return ch
 }
 
 /**

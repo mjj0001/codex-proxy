@@ -1,0 +1,40 @@
+# Codex Proxy 配置文件
+# 将 Codex 账号文件放到 auth-dir 指定的目录中
+
+# 监听地址
+listen: ":8080"
+
+# 账号文件目录（存放 JSON 格式的 Codex 账号文件）
+auth-dir: "./auths"
+
+# Codex API 基础 URL
+base-url: "https://chatgpt.com/backend-api/codex"
+
+# HTTP/SOCKS5 代理地址（可选）
+# proxy-url: "http://127.0.0.1:7890"
+
+# 日志级别: debug, info, warn, error
+log-level: "info"
+
+# Token 自动刷新间隔（秒）
+refresh-interval: 3000
+
+# 请求失败最大重试次数（切换账号重试，0 表示不重试）
+max-retry: 2
+
+# 健康检查间隔（秒），0 表示禁用健康检查
+health-check-interval: 300
+
+# 连续失败多少次后自动禁用账号
+health-check-max-failures: 2
+
+# 健康检查并发数
+health-check-concurrency: 50
+
+# Token 并发刷新数（2w 账号建议 100-200）
+refresh-concurrency: 50
+
+# API Key 鉴权（可选，为空则不鉴权）
+# api-keys:
+#   - "sk-your-custom-key-1"
+#   - "sk-your-custom-key-2"
