@@ -34,6 +34,13 @@ const (
 	codexUserAgent     = "codex_cli_rs/0.101.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464"
 )
 
+/* 预分配 SSE 输出字节片段，避免每次事件的内存分配 */
+var (
+	sseDataPrefix = []byte("data: ")
+	sseDataSuffix = []byte("\n\n")
+	sseDoneMarker = []byte("data: [DONE]\n\n")
+)
+
 /**
  * Executor Codex 请求执行器
  * 使用全局共享连接池提升高并发性能
@@ -59,12 +66,17 @@ func NewExecutor(baseURL, proxyURL string) *Executor {
 	}
 
 	transport := &http.Transport{
-		MaxIdleConns:        200,
-		MaxIdleConnsPerHost: 50,
-		MaxConnsPerHost:     100,
-		IdleConnTimeout:     300 * time.Second,
-		TLSHandshakeTimeout: 10 * time.Second,
-		TLSClientConfig:     &tls.Config{InsecureSkipVerify: false},
+		MaxIdleConns:          200,
+		MaxIdleConnsPerHost:   50,
+		MaxConnsPerHost:       100,
+		IdleConnTimeout:       300 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
+		WriteBufferSize:       32 * 1024,
+		ReadBufferSize:        32 * 1024,
+		ForceAttemptHTTP2:     true,
+		DisableCompression:    true, /* SSE 流不需要 gzip 解压开销 */
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: false},
 	}
 
 	if proxyURL != "" {
@@ -98,19 +110,8 @@ func (e *Executor) ExecuteStream(ctx context.Context, account *auth.Account, req
 	/* 应用思考配置并获取真实模型名 */
 	body, baseModel := thinking.ApplyThinking(requestBody, model)
 
-	/* 转换请求格式：OpenAI → Codex */
+	/* 转换请求格式：OpenAI → Codex（转换器内部已处理字段清理） */
 	codexBody := translator.ConvertOpenAIRequestToCodex(baseModel, body, true)
-
-	/* 设置模型和流式参数 */
-	codexBody, _ = sjson.SetBytes(codexBody, "model", baseModel)
-	codexBody, _ = sjson.DeleteBytes(codexBody, "previous_response_id")
-	codexBody, _ = sjson.DeleteBytes(codexBody, "prompt_cache_retention")
-	codexBody, _ = sjson.DeleteBytes(codexBody, "safety_identifier")
-	/* #1901: 剔除 generate 参数，非 Codex 原生后端不支持此参数 */
-	codexBody, _ = sjson.DeleteBytes(codexBody, "generate")
-	if !gjson.GetBytes(codexBody, "instructions").Exists() {
-		codexBody, _ = sjson.SetBytes(codexBody, "instructions", "")
-	}
 
 	/* 构建 HTTP 请求 */
 	apiURL := e.baseURL + "/responses"
@@ -149,22 +150,19 @@ func (e *Executor) ExecuteStream(ctx context.Context, account *auth.Account, req
 	writer.WriteHeader(http.StatusOK)
 
 	flusher, canFlush := writer.(http.Flusher)
-
-	/* 构建反向工具名映射 */
 	reverseToolMap := translator.BuildReverseToolNameMap(requestBody)
 	state := translator.NewStreamState(baseModel)
-
-	/* 逐行读取 SSE 事件并转换 */
 	scanner := bufio.NewScanner(httpResp.Body)
-	scanner.Buffer(nil, 52_428_800)
+	scanner.Buffer(make([]byte, 32*1024), 52_428_800)
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
-		/* 提取流式 usage */
 		extractUsageFromStreamLine(line, account)
 		chunks := translator.ConvertStreamChunk(ctx, line, state, reverseToolMap)
 		for _, chunk := range chunks {
-			_, _ = fmt.Fprintf(writer, "data: %s\n\n", chunk)
+			_, _ = writer.Write(sseDataPrefix)
+			_, _ = writer.Write([]byte(chunk))
+			_, _ = writer.Write(sseDataSuffix)
 			if canFlush {
 				flusher.Flush()
 			}
@@ -176,8 +174,7 @@ func (e *Executor) ExecuteStream(ctx context.Context, account *auth.Account, req
 		return err
 	}
 
-	/* 发送结束标记 */
-	_, _ = fmt.Fprintf(writer, "data: [DONE]\n\n")
+	_, _ = writer.Write(sseDoneMarker)
 	if canFlush {
 		flusher.Flush()
 	}
@@ -200,18 +197,8 @@ func (e *Executor) ExecuteNonStream(ctx context.Context, account *auth.Account, 
 	/* 应用思考配置 */
 	body, baseModel := thinking.ApplyThinking(requestBody, model)
 
-	/* 转换请求格式 */
+	/* 转换请求格式（转换器内部已处理字段清理，stream 已设为 true） */
 	codexBody := translator.ConvertOpenAIRequestToCodex(baseModel, body, true)
-	codexBody, _ = sjson.SetBytes(codexBody, "model", baseModel)
-	codexBody, _ = sjson.SetBytes(codexBody, "stream", true)
-	codexBody, _ = sjson.DeleteBytes(codexBody, "previous_response_id")
-	codexBody, _ = sjson.DeleteBytes(codexBody, "prompt_cache_retention")
-	codexBody, _ = sjson.DeleteBytes(codexBody, "safety_identifier")
-	/* #1901: 剔除 generate 参数 */
-	codexBody, _ = sjson.DeleteBytes(codexBody, "generate")
-	if !gjson.GetBytes(codexBody, "instructions").Exists() {
-		codexBody, _ = sjson.SetBytes(codexBody, "instructions", "")
-	}
 
 	/* 构建并发送请求 */
 	apiURL := e.baseURL + "/responses"
@@ -285,16 +272,8 @@ func (e *Executor) ExecuteResponsesStream(ctx context.Context, account *auth.Acc
 	/* 应用思考配置并获取真实模型名 */
 	body, baseModel := thinking.ApplyThinking(requestBody, model)
 
-	/* Responses API 格式已经很接近 Codex 格式，使用通用转换器处理 */
+	/* 转换请求格式（转换器内部已处理字段清理） */
 	codexBody := translator.ConvertOpenAIRequestToCodex(baseModel, body, true)
-	codexBody, _ = sjson.SetBytes(codexBody, "model", baseModel)
-	codexBody, _ = sjson.DeleteBytes(codexBody, "previous_response_id")
-	codexBody, _ = sjson.DeleteBytes(codexBody, "prompt_cache_retention")
-	codexBody, _ = sjson.DeleteBytes(codexBody, "safety_identifier")
-	codexBody, _ = sjson.DeleteBytes(codexBody, "generate")
-	if !gjson.GetBytes(codexBody, "instructions").Exists() {
-		codexBody, _ = sjson.SetBytes(codexBody, "instructions", "")
-	}
 
 	/* 构建 HTTP 请求 */
 	apiURL := e.baseURL + "/responses"
@@ -371,17 +350,8 @@ func (e *Executor) ExecuteResponsesNonStream(ctx context.Context, account *auth.
 	/* 应用思考配置 */
 	body, baseModel := thinking.ApplyThinking(requestBody, model)
 
-	/* 转换请求格式 */
+	/* 转换请求格式（转换器内部已处理字段清理，stream 已设为 true） */
 	codexBody := translator.ConvertOpenAIRequestToCodex(baseModel, body, true)
-	codexBody, _ = sjson.SetBytes(codexBody, "model", baseModel)
-	codexBody, _ = sjson.SetBytes(codexBody, "stream", true)
-	codexBody, _ = sjson.DeleteBytes(codexBody, "previous_response_id")
-	codexBody, _ = sjson.DeleteBytes(codexBody, "prompt_cache_retention")
-	codexBody, _ = sjson.DeleteBytes(codexBody, "safety_identifier")
-	codexBody, _ = sjson.DeleteBytes(codexBody, "generate")
-	if !gjson.GetBytes(codexBody, "instructions").Exists() {
-		codexBody, _ = sjson.SetBytes(codexBody, "instructions", "")
-	}
 
 	/* 构建并发送请求 */
 	apiURL := e.baseURL + "/responses"
@@ -632,17 +602,8 @@ func (e *Executor) ExecuteRawCodexStream(ctx context.Context, account *auth.Acco
 	/* 应用思考配置 */
 	body, baseModel := thinking.ApplyThinking(requestBody, model)
 
-	/* 转换请求格式 */
+	/* 转换请求格式（转换器内部已处理字段清理） */
 	codexBody := translator.ConvertOpenAIRequestToCodex(baseModel, body, true)
-	codexBody, _ = sjson.SetBytes(codexBody, "model", baseModel)
-	codexBody, _ = sjson.SetBytes(codexBody, "stream", true)
-	codexBody, _ = sjson.DeleteBytes(codexBody, "previous_response_id")
-	codexBody, _ = sjson.DeleteBytes(codexBody, "prompt_cache_retention")
-	codexBody, _ = sjson.DeleteBytes(codexBody, "safety_identifier")
-	codexBody, _ = sjson.DeleteBytes(codexBody, "generate")
-	if !gjson.GetBytes(codexBody, "instructions").Exists() {
-		codexBody, _ = sjson.SetBytes(codexBody, "instructions", "")
-	}
 
 	/* 构建并发送请求 */
 	apiURL := e.baseURL + "/responses"

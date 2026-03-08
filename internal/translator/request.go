@@ -62,36 +62,32 @@ func ConvertOpenAIRequestToCodex(modelName string, rawJSON []byte, stream bool) 
 	 */
 	existingInput := gjson.GetBytes(rawJSON, "input")
 	if existingInput.Exists() && existingInput.IsArray() {
-		/* Responses API 格式：input 已存在，直接透传 */
-		out, _ = sjson.SetRaw(out, "input", existingInput.Raw)
-
-		/* 透传 instructions（如果有的话） */
-		if inst := gjson.GetBytes(rawJSON, "instructions"); inst.Exists() {
-			out, _ = sjson.Set(out, "instructions", inst.String())
+		/*
+		 * Responses API 快速路径：直接在原始 JSON 上原地修改
+		 * 不重建 JSON，大幅减少序列化开销和内存分配
+		 */
+		result := make([]byte, len(rawJSON))
+		copy(result, rawJSON)
+		result, _ = sjson.SetBytes(result, "model", modelName)
+		result, _ = sjson.SetBytes(result, "stream", stream)
+		result, _ = sjson.SetBytes(result, "store", false)
+		if v := gjson.GetBytes(rawJSON, "reasoning_effort"); v.Exists() {
+			result, _ = sjson.SetBytes(result, "reasoning.effort", v.Value())
+			result, _ = sjson.DeleteBytes(result, "reasoning_effort")
 		}
 
-		/* 透传 tools（如果有的话） */
-		if t := gjson.GetBytes(rawJSON, "tools"); t.Exists() && t.IsArray() {
-			out, _ = sjson.SetRaw(out, "tools", t.Raw)
+		/* 确保 instructions 存在 */
+		if !gjson.GetBytes(result, "instructions").Exists() {
+			result, _ = sjson.SetBytes(result, "instructions", "")
 		}
 
-		/* 透传 tool_choice */
-		if tc := gjson.GetBytes(rawJSON, "tool_choice"); tc.Exists() {
-			out, _ = sjson.SetRaw(out, "tool_choice", tc.Raw)
-		}
+		/* 删除上游不支持的参数 */
+		result, _ = sjson.DeleteBytes(result, "previous_response_id")
+		result, _ = sjson.DeleteBytes(result, "prompt_cache_retention")
+		result, _ = sjson.DeleteBytes(result, "safety_identifier")
+		result, _ = sjson.DeleteBytes(result, "generate")
 
-		/* 透传 text（response_format） */
-		if txt := gjson.GetBytes(rawJSON, "text"); txt.Exists() {
-			out, _ = sjson.SetRaw(out, "text", txt.Raw)
-		}
-
-		/* #1911/#1908: 保留 service_tier 透传 */
-		if st := gjson.GetBytes(rawJSON, "service_tier"); st.Exists() {
-			out, _ = sjson.Set(out, "service_tier", st.Value())
-		}
-
-		out, _ = sjson.Set(out, "store", false)
-		return []byte(out)
+		return result
 	}
 
 	/* Chat Completions 格式：messages → input 转换 */
