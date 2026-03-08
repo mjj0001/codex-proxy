@@ -188,36 +188,53 @@ func (h *ProxyHandler) handleModels(c *gin.Context) {
 }
 
 /**
- * isRetryableStatus 判断 HTTP 状态码是否可重试（切换账号重试）
- * 403（地域封锁 / Cloudflare 拦截）换账号也无法解决，不重试
- * 400（参数/模型错误）、401（认证失效）、429（限频）、5xx 均可切换账号重试
- * @param code - HTTP 状态码
- * @returns bool - 是否可重试
+ * buildRetryConfig 构建 executor 内部重试配置
+ * 将 handler 的账号选择和 401 处理逻辑封装为回调传给 executor
+ * @returns executor.RetryConfig - 重试配置
  */
-func isRetryableStatus(code int) bool {
-	if code >= 200 && code < 300 {
-		return false
+func (h *ProxyHandler) buildRetryConfig() executor.RetryConfig {
+	return executor.RetryConfig{
+		PickFn: func(model string, excluded map[string]bool) (*auth.Account, error) {
+			return h.manager.PickExcluding(model, excluded)
+		},
+		On401Fn: func(acc *auth.Account) {
+			h.manager.HandleAuth401(acc)
+		},
+		MaxRetry: h.maxRetry,
 	}
-	/* 403 地域封锁 / Cloudflare 拦截，换账号也没用 */
-	if code == 403 {
-		return false
+}
+
+/**
+ * handleExecutorError 统一处理 executor 返回的错误
+ * @param c - Gin 上下文
+ * @param err - executor 返回的错误
+ */
+func handleExecutorError(c *gin.Context, err error) {
+	if statusErr, ok := err.(*executor.StatusError); ok {
+		c.JSON(statusErr.Code, gin.H{
+			"error": gin.H{
+				"message": string(statusErr.Body),
+				"type":    "api_error",
+				"code":    fmt.Sprintf("upstream_%d", statusErr.Code),
+			},
+		})
+		return
 	}
-	return true
+	sendError(c, http.StatusInternalServerError, err.Error(), "server_error")
 }
 
 /**
  * handleChatCompletions 处理 Chat Completions 请求
- * 解析请求 → 选择账号 → 转换格式 → 执行 → 失败则切换账号重试 → 返回响应
+ * 解析请求 → executor 内部选择账号/重试 → 返回响应
+ * 重试逻辑在 executor 内部完成，流式请求的 SSE 头只在成功后才写给客户端
  */
 func (h *ProxyHandler) handleChatCompletions(c *gin.Context) {
-	/* 读取请求体 */
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		sendError(c, http.StatusBadRequest, "读取请求体失败", "invalid_request_error")
 		return
 	}
 
-	/* 解析模型名和流式标志 */
 	model := gjson.GetBytes(body, "model").String()
 	if model == "" {
 		sendError(c, http.StatusBadRequest, "缺少 model 字段", "invalid_request_error")
@@ -227,103 +244,22 @@ func (h *ProxyHandler) handleChatCompletions(c *gin.Context) {
 
 	log.Infof("收到请求: model=%s, stream=%v", model, stream)
 
-	/* 带重试的请求执行 */
-	maxAttempts := h.maxRetry + 1
-	var lastErr error
-	var usedAccounts = make(map[string]bool)
+	rc := h.buildRetryConfig()
 
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		if c.Request.Context().Err() != nil {
-			break
+	if stream {
+		if execErr := h.executor.ExecuteStream(c.Request.Context(), rc, body, model, c.Writer); execErr != nil {
+			log.Errorf("Chat Completions 流式请求失败: %v", execErr)
+			handleExecutorError(c, execErr)
 		}
-
-		/* 选择账号（排除已用过的） */
-		account, pickErr := h.manager.PickExcluding(model, usedAccounts)
-		if pickErr != nil {
-			if attempt == 0 {
-				log.Errorf("选择账号失败: %v", pickErr)
-				sendError(c, http.StatusServiceUnavailable, fmt.Sprintf("没有可用账号: %v", pickErr), "server_error")
-				return
-			}
-			/* 重试时无更多可用账号，返回上次错误 */
-			break
-		}
-
-		usedAccounts[account.FilePath] = true
-		log.Debugf("使用账号: %s (尝试 %d/%d)", account.GetEmail(), attempt+1, maxAttempts)
-
-		var execErr error
-		var result []byte
-
-		if stream {
-			execErr = h.executor.ExecuteStream(c.Request.Context(), account, body, model, c.Writer)
-		} else {
-			result, execErr = h.executor.ExecuteNonStream(c.Request.Context(), account, body, model)
-		}
-
-		/* 成功 */
-		if execErr == nil {
-			account.RecordSuccess()
-			if !stream {
-				var jsonResult interface{}
-				if unmarshalErr := json.Unmarshal(result, &jsonResult); unmarshalErr != nil {
-					c.Data(http.StatusOK, "application/json", result)
-				} else {
-					c.JSON(http.StatusOK, jsonResult)
-				}
-			}
+	} else {
+		result, execErr := h.executor.ExecuteNonStream(c.Request.Context(), rc, body, model)
+		if execErr != nil {
+			log.Errorf("Chat Completions 非流式请求失败: %v", execErr)
+			handleExecutorError(c, execErr)
 			return
 		}
-
-		lastErr = execErr
-
-		/* 检查是否可重试 */
-		if statusErr, ok := execErr.(*executor.StatusError); ok {
-			/* 401: 先冷却+切换，后台异步刷新，刷新失败再删除 */
-			if statusErr.Code == 401 {
-				h.manager.HandleAuth401(account)
-			} else if executor.ShouldRemoveAccount(statusErr.Code) {
-				h.manager.RemoveAccount(account, fmt.Sprintf("request_%d", statusErr.Code))
-			}
-
-			if isRetryableStatus(statusErr.Code) && attempt < maxAttempts-1 {
-				log.Warnf("账号 [%s] 请求失败 [%d]，切换账号重试", account.GetEmail(), statusErr.Code)
-				continue
-			}
-			c.JSON(statusErr.Code, gin.H{
-				"error": gin.H{
-					"message": string(statusErr.Body),
-					"type":    "api_error",
-					"code":    fmt.Sprintf("upstream_%d", statusErr.Code),
-				},
-			})
-			return
-		}
-
-		/* 非 StatusError（网络错误/读取失败等）也切换账号重试 */
-		if attempt < maxAttempts-1 {
-			log.Warnf("账号 [%s] 上游错误，切换账号重试: %v", account.GetEmail(), execErr)
-			continue
-		}
-		break
+		c.Data(http.StatusOK, "application/json", result)
 	}
-
-	/* 所有重试都失败 */
-	if lastErr != nil {
-		log.Errorf("所有重试均失败: %v", lastErr)
-		if statusErr, ok := lastErr.(*executor.StatusError); ok {
-			c.JSON(statusErr.Code, gin.H{
-				"error": gin.H{
-					"message": string(statusErr.Body),
-					"type":    "api_error",
-				},
-			})
-			return
-		}
-		sendError(c, http.StatusInternalServerError, lastErr.Error(), "server_error")
-		return
-	}
-	sendError(c, http.StatusServiceUnavailable, "请求失败", "server_error")
 }
 
 /**
@@ -406,19 +342,16 @@ func writeSSEProgress(c *gin.Context, ch <-chan auth.ProgressEvent) {
 
 /**
  * handleResponses 处理 Responses API 请求
- * 独立处理 Responses API 格式（input 数组 + reasoning.effort），
  * 直接透传 Codex 原生 SSE 事件或 response 对象，不做 Chat Completions 格式转换
- * 支持流式和非流式响应、带重试的账号切换
+ * 重试逻辑在 executor 内部完成
  */
 func (h *ProxyHandler) handleResponses(c *gin.Context) {
-	/* 读取请求体 */
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		sendError(c, http.StatusBadRequest, "读取请求体失败", "invalid_request_error")
 		return
 	}
 
-	/* 解析模型名和流式标志 */
 	model := gjson.GetBytes(body, "model").String()
 	if model == "" {
 		sendError(c, http.StatusBadRequest, "缺少 model 字段", "invalid_request_error")
@@ -428,113 +361,36 @@ func (h *ProxyHandler) handleResponses(c *gin.Context) {
 
 	log.Infof("收到 Responses 请求: model=%s, stream=%v", model, stream)
 
-	/* 带重试的请求执行 */
-	maxAttempts := h.maxRetry + 1
-	var lastErr error
-	var usedAccounts = make(map[string]bool)
+	rc := h.buildRetryConfig()
 
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		if c.Request.Context().Err() != nil {
-			break
+	if stream {
+		if execErr := h.executor.ExecuteResponsesStream(c.Request.Context(), rc, body, model, c.Writer); execErr != nil {
+			log.Errorf("Responses 流式请求失败: %v", execErr)
+			handleExecutorError(c, execErr)
 		}
-
-		/* 选择账号（排除已用过的） */
-		account, pickErr := h.manager.PickExcluding(model, usedAccounts)
-		if pickErr != nil {
-			if attempt == 0 {
-				log.Errorf("选择账号失败: %v", pickErr)
-				sendError(c, http.StatusServiceUnavailable, fmt.Sprintf("没有可用账号: %v", pickErr), "server_error")
-				return
-			}
-			break
-		}
-
-		usedAccounts[account.FilePath] = true
-		log.Debugf("Responses 使用账号: %s (尝试 %d/%d)", account.GetEmail(), attempt+1, maxAttempts)
-
-		var execErr error
-		var result []byte
-
-		if stream {
-			execErr = h.executor.ExecuteResponsesStream(c.Request.Context(), account, body, model, c.Writer)
-		} else {
-			result, execErr = h.executor.ExecuteResponsesNonStream(c.Request.Context(), account, body, model)
-		}
-
-		/* 成功 */
-		if execErr == nil {
-			account.RecordSuccess()
-			if !stream {
-				c.Data(http.StatusOK, "application/json", result)
-			}
+	} else {
+		result, execErr := h.executor.ExecuteResponsesNonStream(c.Request.Context(), rc, body, model)
+		if execErr != nil {
+			log.Errorf("Responses 非流式请求失败: %v", execErr)
+			handleExecutorError(c, execErr)
 			return
 		}
-
-		lastErr = execErr
-
-		/* 检查是否可重试 */
-		if statusErr, ok := execErr.(*executor.StatusError); ok {
-			/* 401: 先冷却+切换，后台异步刷新，刷新失败再删除 */
-			if statusErr.Code == 401 {
-				h.manager.HandleAuth401(account)
-			} else if executor.ShouldRemoveAccount(statusErr.Code) {
-				h.manager.RemoveAccount(account, fmt.Sprintf("request_%d", statusErr.Code))
-			}
-
-			if isRetryableStatus(statusErr.Code) && attempt < maxAttempts-1 {
-				log.Warnf("账号 [%s] Responses 请求失败 [%d]，切换账号重试", account.GetEmail(), statusErr.Code)
-				continue
-			}
-			c.JSON(statusErr.Code, gin.H{
-				"error": gin.H{
-					"message": string(statusErr.Body),
-					"type":    "api_error",
-					"code":    fmt.Sprintf("upstream_%d", statusErr.Code),
-				},
-			})
-			return
-		}
-
-		/* 非 StatusError（网络错误/读取失败等）也切换账号重试 */
-		if attempt < maxAttempts-1 {
-			log.Warnf("账号 [%s] Responses 上游错误，切换账号重试: %v", account.GetEmail(), execErr)
-			continue
-		}
-		break
+		c.Data(http.StatusOK, "application/json", result)
 	}
-
-	/* 所有重试都失败 */
-	if lastErr != nil {
-		log.Errorf("Responses 所有重试均失败: %v", lastErr)
-		if statusErr, ok := lastErr.(*executor.StatusError); ok {
-			c.JSON(statusErr.Code, gin.H{
-				"error": gin.H{
-					"message": string(statusErr.Body),
-					"type":    "api_error",
-				},
-			})
-			return
-		}
-		sendError(c, http.StatusInternalServerError, lastErr.Error(), "server_error")
-		return
-	}
-	sendError(c, http.StatusServiceUnavailable, "请求失败", "server_error")
 }
 
 /**
  * handleResponsesCompact 处理 Responses Compact API 请求
  * 使用 /responses/compact 端点，直接透传 compact 格式（CBOR/SSE）响应
- * 支持流式和非流式响应、带重试的账号切换
+ * 重试逻辑在 executor 内部完成
  */
 func (h *ProxyHandler) handleResponsesCompact(c *gin.Context) {
-	/* 读取请求体 */
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		sendError(c, http.StatusBadRequest, "读取请求体失败", "invalid_request_error")
 		return
 	}
 
-	/* 解析模型名和流式标志 */
 	model := gjson.GetBytes(body, "model").String()
 	if model == "" {
 		sendError(c, http.StatusBadRequest, "缺少 model 字段", "invalid_request_error")
@@ -544,97 +400,22 @@ func (h *ProxyHandler) handleResponsesCompact(c *gin.Context) {
 
 	log.Infof("收到 Responses Compact 请求: model=%s, stream=%v", model, stream)
 
-	/* 带重试的请求执行 */
-	maxAttempts := h.maxRetry + 1
-	var lastErr error
-	var usedAccounts = make(map[string]bool)
+	rc := h.buildRetryConfig()
 
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		if c.Request.Context().Err() != nil {
-			break
+	if stream {
+		if execErr := h.executor.ExecuteResponsesCompactStream(c.Request.Context(), rc, body, model, c.Writer); execErr != nil {
+			log.Errorf("Compact 流式请求失败: %v", execErr)
+			handleExecutorError(c, execErr)
 		}
-
-		/* 选择账号（排除已用过的） */
-		account, pickErr := h.manager.PickExcluding(model, usedAccounts)
-		if pickErr != nil {
-			if attempt == 0 {
-				log.Errorf("选择账号失败: %v", pickErr)
-				sendError(c, http.StatusServiceUnavailable, fmt.Sprintf("没有可用账号: %v", pickErr), "server_error")
-				return
-			}
-			break
-		}
-
-		usedAccounts[account.FilePath] = true
-		log.Debugf("Compact 使用账号: %s (尝试 %d/%d)", account.GetEmail(), attempt+1, maxAttempts)
-
-		var execErr error
-		var result []byte
-
-		if stream {
-			execErr = h.executor.ExecuteResponsesCompactStream(c.Request.Context(), account, body, model, c.Writer)
-		} else {
-			result, execErr = h.executor.ExecuteResponsesCompactNonStream(c.Request.Context(), account, body, model)
-		}
-
-		/* 成功 */
-		if execErr == nil {
-			account.RecordSuccess()
-			if !stream {
-				/* compact 格式透传，使用原始 Content-Type */
-				c.Data(http.StatusOK, "application/json", result)
-			}
+	} else {
+		result, execErr := h.executor.ExecuteResponsesCompactNonStream(c.Request.Context(), rc, body, model)
+		if execErr != nil {
+			log.Errorf("Compact 非流式请求失败: %v", execErr)
+			handleExecutorError(c, execErr)
 			return
 		}
-
-		lastErr = execErr
-
-		/* 检查是否可重试 */
-		if statusErr, ok := execErr.(*executor.StatusError); ok {
-			if statusErr.Code == 401 {
-				h.manager.HandleAuth401(account)
-			} else if executor.ShouldRemoveAccount(statusErr.Code) {
-				h.manager.RemoveAccount(account, fmt.Sprintf("request_%d", statusErr.Code))
-			}
-
-			if isRetryableStatus(statusErr.Code) && attempt < maxAttempts-1 {
-				log.Warnf("账号 [%s] Compact 请求失败 [%d]，切换账号重试", account.GetEmail(), statusErr.Code)
-				continue
-			}
-			c.JSON(statusErr.Code, gin.H{
-				"error": gin.H{
-					"message": string(statusErr.Body),
-					"type":    "api_error",
-					"code":    fmt.Sprintf("upstream_%d", statusErr.Code),
-				},
-			})
-			return
-		}
-
-		/* 非 StatusError（网络错误/读取失败等）也切换账号重试 */
-		if attempt < maxAttempts-1 {
-			log.Warnf("账号 [%s] Compact 上游错误，切换账号重试: %v", account.GetEmail(), execErr)
-			continue
-		}
-		break
+		c.Data(http.StatusOK, "application/json", result)
 	}
-
-	/* 所有重试都失败 */
-	if lastErr != nil {
-		log.Errorf("Compact 所有重试均失败: %v", lastErr)
-		if statusErr, ok := lastErr.(*executor.StatusError); ok {
-			c.JSON(statusErr.Code, gin.H{
-				"error": gin.H{
-					"message": string(statusErr.Body),
-					"type":    "api_error",
-				},
-			})
-			return
-		}
-		sendError(c, http.StatusInternalServerError, lastErr.Error(), "server_error")
-		return
-	}
-	sendError(c, http.StatusServiceUnavailable, "请求失败", "server_error")
 }
 
 /**

@@ -394,43 +394,58 @@ func (m *Manager) scanNewFiles() {
 		return
 	}
 
-	newCount := 0
+	/* 第一阶段：在读锁下快速过滤出未加载的文件路径 */
+	m.mu.RLock()
+	var candidates []string
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".json") {
 			continue
 		}
-
 		filePath := filepath.Join(m.authDir, entry.Name())
-
-		/* 检查是否已在号池中 */
-		m.mu.RLock()
-		_, exists := m.accountIndex[filePath]
-		m.mu.RUnlock()
-
-		if exists {
-			continue
+		if _, exists := m.accountIndex[filePath]; !exists {
+			candidates = append(candidates, filePath)
 		}
+	}
+	m.mu.RUnlock()
 
+	if len(candidates) == 0 {
+		return
+	}
+
+	/* 第二阶段：在锁外加载所有新文件（IO 密集，不持锁） */
+	type newEntry struct {
+		path string
+		acc  *Account
+	}
+	loaded := make([]newEntry, 0, len(candidates))
+	for _, filePath := range candidates {
 		acc, loadErr := loadAccountFromFile(filePath)
 		if loadErr != nil {
 			continue
 		}
-
-		m.mu.Lock()
-		/* 双检查防止并发 */
-		if _, exists2 := m.accountIndex[filePath]; !exists2 {
-			m.accounts = append(m.accounts, acc)
-			m.accountIndex[filePath] = acc
-			newCount++
-		}
-		m.mu.Unlock()
+		loaded = append(loaded, newEntry{path: filePath, acc: acc})
 	}
 
+	if len(loaded) == 0 {
+		return
+	}
+
+	/* 第三阶段：一次性写锁批量写入（双检查防并发） */
+	m.mu.Lock()
+	newCount := 0
+	for _, entry := range loaded {
+		if _, exists := m.accountIndex[entry.path]; !exists {
+			m.accounts = append(m.accounts, entry.acc)
+			m.accountIndex[entry.path] = entry.acc
+			newCount++
+		}
+	}
 	if newCount > 0 {
-		/* 发布新快照 */
-		m.mu.Lock()
 		m.publishSnapshot()
-		m.mu.Unlock()
+	}
+	m.mu.Unlock()
+
+	if newCount > 0 {
 		log.Infof("热加载: 新增 %d 个账号，当前总计 %d 个", newCount, m.AccountCount())
 	}
 }

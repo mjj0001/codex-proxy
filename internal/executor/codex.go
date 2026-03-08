@@ -96,54 +96,152 @@ func NewExecutor(baseURL, proxyURL string) *Executor {
 }
 
 /**
- * ExecuteStream 执行流式请求
- * 将 OpenAI 格式请求转换为 Codex 格式，发送并以 SSE 方式返回响应
+ * RetryConfig 内部重试配置
+ * 将重试逻辑封装在 executor 内部，在写响应头之前完成账号切换重试
+ * 客户端完全不感知重试过程，流不会被切断
+ * @field PickFn - 账号选择函数，接收模型名和已排除账号集合
+ * @field On401Fn - 401 错误回调（用于触发后台 Token 刷新）
+ * @field MaxRetry - 最大重试次数（0 表示不重试）
+ */
+type RetryConfig struct {
+	PickFn   func(model string, excluded map[string]bool) (*auth.Account, error)
+	On401Fn  func(acc *auth.Account)
+	MaxRetry int
+}
+
+/**
+ * IsRetryableStatus 判断 HTTP 状态码是否可重试（切换账号重试）
+ * 403（地域封锁 / Cloudflare 拦截）换账号也无法解决，不重试
+ * 400（参数/模型错误）也不重试
+ * 401（认证失效）、429（限频）、5xx 均可切换账号重试
+ * @param code - HTTP 状态码
+ * @returns bool - 是否可重试
+ */
+func IsRetryableStatus(code int) bool {
+	if code >= 200 && code < 300 {
+		return false
+	}
+	switch code {
+	case 400, 403:
+		return false
+	}
+	return true
+}
+
+/**
+ * sendWithRetry 带内部重试的请求发送
+ * 在 executor 内部循环切换账号，直到获得 2xx 响应或耗尽重试次数
+ * 成功时返回打开的 *http.Response（调用方负责关闭 Body）和对应的账号
+ * 失败时返回 StatusError 或网络错误
  *
  * @param ctx - 上下文
- * @param account - 使用的账号
+ * @param rc - 重试配置
+ * @param model - 模型名（传递给 PickFn）
+ * @param apiURL - 请求 URL
+ * @param codexBody - 请求体字节（每次重试自动创建新 Reader）
+ * @param stream - 是否流式（影响 Accept 头）
+ * @returns *http.Response - 成功的上游响应（调用方负责关闭）
+ * @returns *auth.Account - 使用的账号
+ * @returns error - 所有重试均失败时返回错误
+ */
+func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model string, apiURL string, codexBody []byte, stream bool) (*http.Response, *auth.Account, error) {
+	excluded := make(map[string]bool)
+	maxAttempts := rc.MaxRetry + 1
+	var lastErr error
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if ctx.Err() != nil {
+			break
+		}
+
+		account, err := rc.PickFn(model, excluded)
+		if err != nil {
+			if attempt == 0 {
+				return nil, nil, err
+			}
+			break
+		}
+		excluded[account.FilePath] = true
+
+		log.Debugf("使用账号: %s (尝试 %d/%d)", account.GetEmail(), attempt+1, maxAttempts)
+
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(codexBody))
+		if err != nil {
+			return nil, nil, fmt.Errorf("创建请求失败: %w", err)
+		}
+		applyCodexHeaders(httpReq, account, stream)
+
+		httpResp, err := e.httpClient.Do(httpReq)
+		if err != nil {
+			account.RecordFailure()
+			lastErr = fmt.Errorf("请求发送失败: %w", err)
+			if attempt < maxAttempts-1 {
+				log.Warnf("账号 [%s] 网络错误，切换账号重试: %v", account.GetEmail(), err)
+				continue
+			}
+			break
+		}
+
+		/* 2xx 成功 */
+		if httpResp.StatusCode >= 200 && httpResp.StatusCode < 300 {
+			return httpResp, account, nil
+		}
+
+		/* 错误状态码：读取错误体、处理账号状态、判断是否可重试 */
+		errBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
+		_ = httpResp.Body.Close()
+
+		handleAccountError(account, httpResp.StatusCode, errBody)
+
+		if httpResp.StatusCode == 401 && rc.On401Fn != nil {
+			rc.On401Fn(account)
+		}
+
+		statusErr := &StatusError{Code: httpResp.StatusCode, Body: errBody}
+		lastErr = statusErr
+
+		if !IsRetryableStatus(httpResp.StatusCode) {
+			return nil, nil, statusErr
+		}
+
+		if attempt < maxAttempts-1 {
+			log.Warnf("账号 [%s] 请求失败 [%d]，切换账号重试", account.GetEmail(), httpResp.StatusCode)
+			continue
+		}
+	}
+
+	if lastErr != nil {
+		return nil, nil, lastErr
+	}
+	return nil, nil, fmt.Errorf("请求失败")
+}
+
+/**
+ * ExecuteStream 执行流式请求（内部重试）
+ * 将 OpenAI 格式请求转换为 Codex 格式，在内部切换账号重试直到获得 2xx 响应
+ * SSE 头只在成功后才写给客户端，客户端不感知重试过程
+ *
+ * @param ctx - 上下文
+ * @param rc - 内部重试配置
  * @param requestBody - 原始 OpenAI Chat Completions 请求体
  * @param model - 模型名称（可能含思考后缀）
  * @param writer - HTTP 响应写入器
  * @returns error - 执行失败时返回错误
  */
-func (e *Executor) ExecuteStream(ctx context.Context, account *auth.Account, requestBody []byte, model string, writer http.ResponseWriter) error {
-	/* 应用思考配置并获取真实模型名 */
+func (e *Executor) ExecuteStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string, writer http.ResponseWriter) error {
 	body, baseModel := thinking.ApplyThinking(requestBody, model)
-
-	/* 转换请求格式：OpenAI → Codex（转换器内部已处理字段清理） */
 	codexBody := translator.ConvertOpenAIRequestToCodex(baseModel, body, true)
-
-	/* 构建 HTTP 请求 */
 	apiURL := e.baseURL + "/responses"
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(codexBody))
-	if err != nil {
-		return fmt.Errorf("创建请求失败: %w", err)
-	}
 
-	applyCodexHeaders(httpReq, account, true)
-
-	/* 发送请求（使用全局连接池） */
-	httpResp, err := e.httpClient.Do(httpReq)
+	httpResp, account, err := e.sendWithRetry(ctx, rc, model, apiURL, codexBody, true)
 	if err != nil {
-		account.RecordFailure()
-		return fmt.Errorf("请求发送失败: %w", err)
+		return err
 	}
 	defer func() {
 		_ = httpResp.Body.Close()
 	}()
 
-	/* 处理错误状态码 */
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		errBody, _ := io.ReadAll(httpResp.Body)
-		log.Errorf("Codex API 错误 [%d]: %s", httpResp.StatusCode, summarizeError(errBody))
-
-		/* 根据状态码反馈账号状态 */
-		handleAccountError(account, httpResp.StatusCode, errBody)
-
-		return &StatusError{Code: httpResp.StatusCode, Body: errBody}
-	}
-
-	/* 设置 SSE 响应头 */
+	/* 只有到这里才开始写 SSE 头（重试在上面已完成） */
 	writer.Header().Set("Content-Type", "text/event-stream")
 	writer.Header().Set("Cache-Control", "no-cache")
 	writer.Header().Set("Connection", "keep-alive")
@@ -153,15 +251,16 @@ func (e *Executor) ExecuteStream(ctx context.Context, account *auth.Account, req
 	reverseToolMap := translator.BuildReverseToolNameMap(requestBody)
 	state := translator.NewStreamState(baseModel)
 	scanner := bufio.NewScanner(httpResp.Body)
-	scanner.Buffer(make([]byte, 32*1024), 52_428_800)
+	scanner.Buffer(make([]byte, 4*1024), 50*1024*1024)
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		extractUsageFromStreamLine(line, account)
 		chunks := translator.ConvertStreamChunk(ctx, line, state, reverseToolMap)
 		for _, chunk := range chunks {
+			/* 直接写入，零分配，流式高频路径不做内存分配 */
 			_, _ = writer.Write(sseDataPrefix)
-			_, _ = writer.Write([]byte(chunk))
+			_, _ = io.WriteString(writer, chunk)
 			_, _ = writer.Write(sseDataSuffix)
 			if canFlush {
 				flusher.Flush()
@@ -179,62 +278,40 @@ func (e *Executor) ExecuteStream(ctx context.Context, account *auth.Account, req
 		flusher.Flush()
 	}
 
+	account.RecordSuccess()
 	return nil
 }
 
 /**
- * ExecuteNonStream 执行非流式请求
- * 将 OpenAI 格式请求转换为 Codex 格式，发送并返回完整响应
+ * ExecuteNonStream 执行非流式请求（内部重试）
+ * 将 OpenAI 格式请求转换为 Codex 格式，在内部切换账号重试直到获得 2xx 响应
  *
  * @param ctx - 上下文
- * @param account - 使用的账号
+ * @param rc - 内部重试配置
  * @param requestBody - 原始 OpenAI Chat Completions 请求体
  * @param model - 模型名称（可能含思考后缀）
  * @returns []byte - OpenAI Chat Completions 格式的响应 JSON
  * @returns error - 执行失败时返回错误
  */
-func (e *Executor) ExecuteNonStream(ctx context.Context, account *auth.Account, requestBody []byte, model string) ([]byte, error) {
-	/* 应用思考配置 */
+func (e *Executor) ExecuteNonStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string) ([]byte, error) {
 	body, baseModel := thinking.ApplyThinking(requestBody, model)
-
-	/* 转换请求格式（转换器内部已处理字段清理，stream 已设为 true） */
 	codexBody := translator.ConvertOpenAIRequestToCodex(baseModel, body, true)
-
-	/* 构建并发送请求 */
 	apiURL := e.baseURL + "/responses"
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(codexBody))
-	if err != nil {
-		return nil, fmt.Errorf("创建请求失败: %w", err)
-	}
 
-	applyCodexHeaders(httpReq, account, true)
-
-	httpResp, err := e.httpClient.Do(httpReq)
+	httpResp, account, err := e.sendWithRetry(ctx, rc, model, apiURL, codexBody, true)
 	if err != nil {
-		account.RecordFailure()
-		return nil, fmt.Errorf("请求发送失败: %w", err)
+		return nil, err
 	}
 	defer func() {
 		_ = httpResp.Body.Close()
 	}()
 
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		errBody, _ := io.ReadAll(httpResp.Body)
-		handleAccountError(account, httpResp.StatusCode, errBody)
-		return nil, &StatusError{Code: httpResp.StatusCode, Body: errBody}
-	}
-
-	/*
-	 * 边读边找 response.completed 事件，找到即返回
-	 * 不等完整 SSE 流结束，大幅减少非流式请求的等待时间
-	 */
 	reverseToolMap := translator.BuildReverseToolNameMap(requestBody)
 	scanner := bufio.NewScanner(httpResp.Body)
-	scanner.Buffer(nil, 52_428_800)
+	scanner.Buffer(make([]byte, 4*1024), 50*1024*1024)
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
-		/* 提取流式 usage */
 		extractUsageFromStreamLine(line, account)
 
 		if !bytes.HasPrefix(line, []byte("data:")) {
@@ -246,6 +323,7 @@ func (e *Executor) ExecuteNonStream(ctx context.Context, account *auth.Account, 
 		}
 		result := translator.ConvertNonStreamResponse(ctx, jsonData, reverseToolMap)
 		if result != "" {
+			account.RecordSuccess()
 			return []byte(result), nil
 		}
 	}
@@ -258,63 +336,36 @@ func (e *Executor) ExecuteNonStream(ctx context.Context, account *auth.Account, 
 }
 
 /**
- * ExecuteResponsesStream 执行 Responses API 流式请求
+ * ExecuteResponsesStream 执行 Responses API 流式请求（内部重试）
  * 直接透传 Codex SSE 事件到客户端，不做 Chat Completions 格式转换
  *
  * @param ctx - 上下文
- * @param account - 使用的账号
+ * @param rc - 内部重试配置
  * @param requestBody - Responses API 格式的请求体
  * @param model - 模型名称（可能含思考后缀）
  * @param writer - HTTP 响应写入器
  * @returns error - 执行失败时返回错误
  */
-func (e *Executor) ExecuteResponsesStream(ctx context.Context, account *auth.Account, requestBody []byte, model string, writer http.ResponseWriter) error {
-	/* 应用思考配置并获取真实模型名 */
+func (e *Executor) ExecuteResponsesStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string, writer http.ResponseWriter) error {
 	body, baseModel := thinking.ApplyThinking(requestBody, model)
-
-	/* 转换请求格式（转换器内部已处理字段清理） */
 	codexBody := translator.ConvertOpenAIRequestToCodex(baseModel, body, true)
-
-	/* 构建 HTTP 请求 */
 	apiURL := e.baseURL + "/responses"
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(codexBody))
-	if err != nil {
-		return fmt.Errorf("创建请求失败: %w", err)
-	}
 
-	applyCodexHeaders(httpReq, account, true)
-
-	/* 发送请求 */
-	httpResp, err := e.httpClient.Do(httpReq)
+	httpResp, account, err := e.sendWithRetry(ctx, rc, model, apiURL, codexBody, true)
 	if err != nil {
-		account.RecordFailure()
-		return fmt.Errorf("请求发送失败: %w", err)
+		return err
 	}
 	defer func() {
 		_ = httpResp.Body.Close()
 	}()
 
-	/* 处理错误状态码 */
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		errBody, _ := io.ReadAll(httpResp.Body)
-		log.Errorf("Codex API 错误 [%d]: %s", httpResp.StatusCode, summarizeError(errBody))
-		handleAccountError(account, httpResp.StatusCode, errBody)
-		return &StatusError{Code: httpResp.StatusCode, Body: errBody}
-	}
-
-	/* 设置 SSE 响应头 */
 	writer.Header().Set("Content-Type", "text/event-stream")
 	writer.Header().Set("Cache-Control", "no-cache")
 	writer.Header().Set("Connection", "keep-alive")
 	writer.WriteHeader(http.StatusOK)
 
 	flusher, canFlush := writer.(http.Flusher)
-
-	/*
-	 * 直接字节级实时转发，不经过 Scanner 缓冲
-	 * 每读到一块数据立即写入客户端并 Flush，实现真正的实时转发
-	 */
-	buf := make([]byte, 8192)
+	buf := make([]byte, 32*1024)
 	for {
 		n, readErr := httpResp.Body.Read(buf)
 		if n > 0 {
@@ -332,57 +383,36 @@ func (e *Executor) ExecuteResponsesStream(ctx context.Context, account *auth.Acc
 		}
 	}
 
+	account.RecordSuccess()
 	return nil
 }
 
 /**
- * ExecuteResponsesNonStream 执行 Responses API 非流式请求
+ * ExecuteResponsesNonStream 执行 Responses API 非流式请求（内部重试）
  * 从 Codex SSE 响应中提取 response.completed 事件，返回原生 response 对象
  *
  * @param ctx - 上下文
- * @param account - 使用的账号
+ * @param rc - 内部重试配置
  * @param requestBody - Responses API 格式的请求体
  * @param model - 模型名称（可能含思考后缀）
  * @returns []byte - Codex Responses API 格式的完整响应 JSON
  * @returns error - 执行失败时返回错误
  */
-func (e *Executor) ExecuteResponsesNonStream(ctx context.Context, account *auth.Account, requestBody []byte, model string) ([]byte, error) {
-	/* 应用思考配置 */
+func (e *Executor) ExecuteResponsesNonStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string) ([]byte, error) {
 	body, baseModel := thinking.ApplyThinking(requestBody, model)
-
-	/* 转换请求格式（转换器内部已处理字段清理，stream 已设为 true） */
 	codexBody := translator.ConvertOpenAIRequestToCodex(baseModel, body, true)
-
-	/* 构建并发送请求 */
 	apiURL := e.baseURL + "/responses"
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(codexBody))
-	if err != nil {
-		return nil, fmt.Errorf("创建请求失败: %w", err)
-	}
 
-	applyCodexHeaders(httpReq, account, true)
-
-	httpResp, err := e.httpClient.Do(httpReq)
+	httpResp, account, err := e.sendWithRetry(ctx, rc, model, apiURL, codexBody, true)
 	if err != nil {
-		account.RecordFailure()
-		return nil, fmt.Errorf("请求发送失败: %w", err)
+		return nil, err
 	}
 	defer func() {
 		_ = httpResp.Body.Close()
 	}()
 
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		errBody, _ := io.ReadAll(httpResp.Body)
-		handleAccountError(account, httpResp.StatusCode, errBody)
-		return nil, &StatusError{Code: httpResp.StatusCode, Body: errBody}
-	}
-
-	/*
-	 * 边读边找 response.completed 事件，找到即返回
-	 * 不等完整 SSE 流结束，大幅减少非流式请求的等待时间
-	 */
 	scanner := bufio.NewScanner(httpResp.Body)
-	scanner.Buffer(nil, 52_428_800)
+	scanner.Buffer(make([]byte, 4*1024), 50*1024*1024)
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -395,8 +425,8 @@ func (e *Executor) ExecuteResponsesNonStream(ctx context.Context, account *auth.
 		if gjson.GetBytes(jsonData, "type").String() != "response.completed" {
 			continue
 		}
-		/* 返回 response 对象（Responses API 原生格式） */
 		if resp := gjson.GetBytes(jsonData, "response"); resp.Exists() {
+			account.RecordSuccess()
 			return []byte(resp.Raw), nil
 		}
 	}
@@ -409,53 +439,28 @@ func (e *Executor) ExecuteResponsesNonStream(ctx context.Context, account *auth.
 }
 
 /**
- * ExecuteResponsesCompactStream 执行 Responses Compact API 流式请求
+ * ExecuteResponsesCompactStream 执行 Responses Compact API 流式请求（内部重试）
  * 使用 /responses/compact 端点，直接透传 Codex SSE 事件到客户端
  *
  * @param ctx - 上下文
- * @param account - 使用的账号
+ * @param rc - 内部重试配置
  * @param requestBody - Responses API 格式的请求体
  * @param model - 模型名称（可能含思考后缀）
  * @param writer - HTTP 响应写入器
  * @returns error - 执行失败时返回错误
  */
-func (e *Executor) ExecuteResponsesCompactStream(ctx context.Context, account *auth.Account, requestBody []byte, model string, writer http.ResponseWriter) error {
-	/* 应用思考配置并获取真实模型名 */
+func (e *Executor) ExecuteResponsesCompactStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string, writer http.ResponseWriter) error {
 	body, baseModel := thinking.ApplyThinking(requestBody, model)
-
-	/*
-	 * Compact 端点直接透传请求体，不使用通用转换器
-	 * 通用转换器会注入 stream/parallel_tool_calls/reasoning/include 等 compact 不支持的参数
-	 * 只做模型名替换和最小字段清理
-	 */
 	codexBody := cleanCompactBody(body, baseModel)
-
-	/* 构建 HTTP 请求 - 使用 /responses/compact 端点 */
 	apiURL := e.baseURL + "/responses/compact"
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(codexBody))
-	if err != nil {
-		return fmt.Errorf("创建请求失败: %w", err)
-	}
 
-	applyCodexHeaders(httpReq, account, true)
-
-	/* 发送请求 */
-	httpResp, err := e.httpClient.Do(httpReq)
+	httpResp, account, err := e.sendWithRetry(ctx, rc, model, apiURL, codexBody, true)
 	if err != nil {
-		account.RecordFailure()
-		return fmt.Errorf("请求发送失败: %w", err)
+		return err
 	}
 	defer func() {
 		_ = httpResp.Body.Close()
 	}()
-
-	/* 处理错误状态码 */
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		errBody, _ := io.ReadAll(httpResp.Body)
-		log.Errorf("Codex Compact API 错误 [%d]: %s", httpResp.StatusCode, summarizeError(errBody))
-		handleAccountError(account, httpResp.StatusCode, errBody)
-		return &StatusError{Code: httpResp.StatusCode, Body: errBody}
-	}
 
 	/* 透传响应头 */
 	for k, vs := range httpResp.Header {
@@ -466,8 +471,6 @@ func (e *Executor) ExecuteResponsesCompactStream(ctx context.Context, account *a
 	writer.WriteHeader(http.StatusOK)
 
 	flusher, canFlush := writer.(http.Flusher)
-
-	/* 直接透传响应体（SSE 或 CBOR 等 compact 格式） */
 	buf := make([]byte, 32*1024)
 	for {
 		n, readErr := httpResp.Body.Read(buf)
@@ -482,60 +485,40 @@ func (e *Executor) ExecuteResponsesCompactStream(ctx context.Context, account *a
 		}
 	}
 
+	account.RecordSuccess()
 	return nil
 }
 
 /**
- * ExecuteResponsesCompactNonStream 执行 Responses Compact API 非流式请求
+ * ExecuteResponsesCompactNonStream 执行 Responses Compact API 非流式请求（内部重试）
  * 使用 /responses/compact 端点，返回 compact 格式的完整响应
  *
  * @param ctx - 上下文
- * @param account - 使用的账号
+ * @param rc - 内部重试配置
  * @param requestBody - Responses API 格式的请求体
  * @param model - 模型名称（可能含思考后缀）
  * @returns []byte - compact 格式的完整响应
  * @returns error - 执行失败时返回错误
  */
-func (e *Executor) ExecuteResponsesCompactNonStream(ctx context.Context, account *auth.Account, requestBody []byte, model string) ([]byte, error) {
-	/* 应用思考配置 */
+func (e *Executor) ExecuteResponsesCompactNonStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string) ([]byte, error) {
 	body, baseModel := thinking.ApplyThinking(requestBody, model)
-
-	/*
-	 * Compact 端点直接透传请求体，不使用通用转换器
-	 * 只做模型名替换和最小字段清理
-	 */
 	codexBody := cleanCompactBody(body, baseModel)
-
-	/* 构建并发送请求 - 使用 /responses/compact 端点 */
 	apiURL := e.baseURL + "/responses/compact"
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(codexBody))
-	if err != nil {
-		return nil, fmt.Errorf("创建请求失败: %w", err)
-	}
 
-	applyCodexHeaders(httpReq, account, false)
-
-	httpResp, err := e.httpClient.Do(httpReq)
+	httpResp, account, err := e.sendWithRetry(ctx, rc, model, apiURL, codexBody, false)
 	if err != nil {
-		account.RecordFailure()
-		return nil, fmt.Errorf("请求发送失败: %w", err)
+		return nil, err
 	}
 	defer func() {
 		_ = httpResp.Body.Close()
 	}()
 
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		errBody, _ := io.ReadAll(httpResp.Body)
-		handleAccountError(account, httpResp.StatusCode, errBody)
-		return nil, &StatusError{Code: httpResp.StatusCode, Body: errBody}
-	}
-
-	/* 读取完整响应并直接返回（compact 格式透传） */
 	data, err := io.ReadAll(httpResp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("读取响应失败: %w", err)
 	}
 
+	account.RecordSuccess()
 	return data, nil
 }
 
@@ -548,11 +531,8 @@ func (e *Executor) ExecuteResponsesCompactNonStream(ctx context.Context, account
  * @returns []byte - 清理后的请求体
  */
 func cleanCompactBody(body []byte, baseModel string) []byte {
-	result := make([]byte, len(body))
-	copy(result, body)
-
-	/* 设置正确的模型名 */
-	result, _ = sjson.SetBytes(result, "model", baseModel)
+	/* sjson 操作会返回新切片，无需手动 copy */
+	result, _ := sjson.SetBytes(body, "model", baseModel)
 
 	/* 删除 Compact 端点不支持的参数 */
 	result, _ = sjson.DeleteBytes(result, "stream")
@@ -595,49 +575,29 @@ type RawResponse struct {
 }
 
 /**
- * ExecuteRawCodexStream 发送请求到 Codex 并返回原始上游响应
+ * ExecuteRawCodexStream 发送请求到 Codex 并返回原始上游响应（内部重试）
  * 不做任何格式转换，由调用方自行处理响应体
  * 用于 Claude API 等需要自定义响应格式的场景
  *
  * @param ctx - 上下文
- * @param account - 使用的账号
+ * @param rc - 内部重试配置
  * @param requestBody - OpenAI Chat Completions 格式的请求体
  * @param model - 模型名称（可能含思考后缀）
  * @returns *RawResponse - 原始响应（成功时调用方需关闭 Body）
+ * @returns *auth.Account - 使用的账号（调用方用于 RecordSuccess）
  * @returns error - 请求发送失败时返回错误
  */
-func (e *Executor) ExecuteRawCodexStream(ctx context.Context, account *auth.Account, requestBody []byte, model string) (*RawResponse, error) {
-	/* 应用思考配置 */
+func (e *Executor) ExecuteRawCodexStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string) (*RawResponse, *auth.Account, error) {
 	body, baseModel := thinking.ApplyThinking(requestBody, model)
-
-	/* 转换请求格式（转换器内部已处理字段清理） */
 	codexBody := translator.ConvertOpenAIRequestToCodex(baseModel, body, true)
-
-	/* 构建并发送请求 */
 	apiURL := e.baseURL + "/responses"
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(codexBody))
+
+	httpResp, account, err := e.sendWithRetry(ctx, rc, model, apiURL, codexBody, true)
 	if err != nil {
-		return nil, fmt.Errorf("创建请求失败: %w", err)
+		return nil, nil, err
 	}
 
-	applyCodexHeaders(httpReq, account, true)
-
-	httpResp, err := e.httpClient.Do(httpReq)
-	if err != nil {
-		account.RecordFailure()
-		return nil, fmt.Errorf("请求发送失败: %w", err)
-	}
-
-	/* 错误状态码：读取错误体并返回 */
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		errBody, _ := io.ReadAll(httpResp.Body)
-		_ = httpResp.Body.Close()
-		handleAccountError(account, httpResp.StatusCode, errBody)
-		return &RawResponse{StatusCode: httpResp.StatusCode, ErrBody: errBody}, &StatusError{Code: httpResp.StatusCode, Body: errBody}
-	}
-
-	/* 成功：返回原始响应体，调用方负责关闭 */
-	return &RawResponse{StatusCode: httpResp.StatusCode, Body: httpResp.Body}, nil
+	return &RawResponse{StatusCode: httpResp.StatusCode, Body: httpResp.Body}, account, nil
 }
 
 /**
@@ -690,18 +650,6 @@ func handleAccountError(account *auth.Account, statusCode int, body []byte) {
 	}
 
 	log.Warnf("账号 [%s] 请求失败 [%d]: %s", account.GetEmail(), statusCode, summarizeError(body))
-}
-
-/**
- * ShouldRemoveAccount 判断此错误是否应该导致账号被立即删除（内存+磁盘）
- * 401（认证失效）现在由 Manager.HandleAuth401 异步处理（先冷却+后台刷新），不在此处直接删除
- * 403（地域封锁/Cloudflare 拦截）、400（参数错误）、429（限频）、5xx（服务端）均不删号
- * @param statusCode - HTTP 状态码
- * @returns bool - 是否应该立即删除
- */
-func ShouldRemoveAccount(statusCode int) bool {
-	/* 401 由 HandleAuth401 异步处理，此处不再直接删除 */
-	return false
 }
 
 /**
@@ -761,34 +709,6 @@ func parseRetryAfter(body []byte) time.Duration {
 
 	/* 默认冷却 60 秒 */
 	return 60 * time.Second
-}
-
-/**
- * extractUsageFromSSE 从 SSE 数据中提取 response.completed 事件的 usage 信息
- * 并记录到账号的 token 使用量统计
- * @param data - 完整的 SSE 响应数据
- * @param account - 要记录 usage 的账号
- */
-func extractUsageFromSSE(data []byte, account *auth.Account) {
-	lines := bytes.Split(data, []byte("\n"))
-	for _, line := range lines {
-		if !bytes.HasPrefix(line, []byte("data:")) {
-			continue
-		}
-		jsonData := bytes.TrimSpace(line[5:])
-		if gjson.GetBytes(jsonData, "type").String() != "response.completed" {
-			continue
-		}
-		usage := gjson.GetBytes(jsonData, "response.usage")
-		if !usage.Exists() {
-			continue
-		}
-		inputTokens := usage.Get("input_tokens").Int()
-		outputTokens := usage.Get("output_tokens").Int()
-		totalTokens := usage.Get("total_tokens").Int()
-		account.RecordUsage(inputTokens, outputTokens, totalTokens)
-		return
-	}
 }
 
 /**

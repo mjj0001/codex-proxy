@@ -203,7 +203,7 @@ func (hc *HealthChecker) checkAccount(ctx context.Context, manager *Manager, acc
 		_ = resp.Body.Close()
 	}()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 
 	switch {
 	case resp.StatusCode == 401:

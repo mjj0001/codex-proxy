@@ -560,7 +560,7 @@ func ConvertCodexFullSSEToClaudeResponse(ctx context.Context, data []byte, model
  * @returns string - 格式化的 SSE 事件字符串
  */
 func formatClaudeSSE(eventType, data string) string {
-	return fmt.Sprintf("event: %s\ndata: %s\n\n", eventType, data)
+	return "event: " + eventType + "\ndata: " + data + "\n\n"
 }
 
 /**

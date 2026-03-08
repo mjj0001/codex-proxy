@@ -12,8 +12,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -111,8 +111,7 @@ func (qc *QuotaChecker) CheckAllStream(ctx context.Context, manager *Manager) <-
 
 		sem := make(chan struct{}, qc.concurrency)
 		var wg sync.WaitGroup
-		var validCount, invalidCount, failCount, current int64
-		var mu sync.Mutex
+		var validCount, invalidCount, failCount, currentIdx atomic.Int64
 
 		for _, acc := range accounts {
 			if ctx.Err() != nil {
@@ -129,21 +128,18 @@ func (qc *QuotaChecker) CheckAllStream(ctx context.Context, manager *Manager) <-
 				result := qc.checkAccount(ctx, a)
 				email := a.GetEmail()
 
-				mu.Lock()
-				current++
-				cur := int(current)
+				cur := int(currentIdx.Add(1))
 				var ok bool
 				switch result {
 				case 1:
-					validCount++
+					validCount.Add(1)
 					ok = true
 				case -1:
-					invalidCount++
+					invalidCount.Add(1)
 					manager.RemoveAccount(a, "quota_invalid")
 				default:
-					failCount++
+					failCount.Add(1)
 				}
-				mu.Unlock()
 
 				ch <- ProgressEvent{
 					Type:    "item",
@@ -157,16 +153,19 @@ func (qc *QuotaChecker) CheckAllStream(ctx context.Context, manager *Manager) <-
 
 		wg.Wait()
 
+		vc := validCount.Load()
+		ic := invalidCount.Load()
+		fc := failCount.Load()
 		elapsed := time.Since(start).Round(time.Millisecond)
 		log.Infof("额度查询完成: 有效 %d, 无效 %d, 失败 %d, 耗时 %v",
-			validCount, invalidCount, failCount, elapsed)
+			vc, ic, fc, elapsed)
 
 		ch <- ProgressEvent{
 			Type:         "done",
 			Message:      "额度查询完成",
 			Total:        total,
-			SuccessCount: int(validCount),
-			FailedCount:  int(invalidCount + failCount),
+			SuccessCount: int(vc),
+			FailedCount:  int(ic + fc),
 			Remaining:    manager.AccountCount(),
 			Duration:     elapsed.String(),
 		}
@@ -223,7 +222,7 @@ func (qc *QuotaChecker) checkAccount(ctx context.Context, acc *Account) int {
 		_ = resp.Body.Close()
 	}()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 
 	now := time.Now()
 	info := &QuotaInfo{
@@ -251,12 +250,14 @@ func (qc *QuotaChecker) checkAccount(ctx context.Context, acc *Account) int {
 	if json.Valid(body) {
 		info.RawData = body
 	} else if len(body) > 0 {
-		/* 非 JSON 响应截断存储 */
+		/* 非 JSON 响应截断后用 json.Marshal 安全转义 */
 		truncated := string(body)
 		if len(truncated) > 200 {
 			truncated = truncated[:200]
 		}
-		info.RawData = json.RawMessage(`"` + strings.ReplaceAll(truncated, `"`, `\"`) + `"`)
+		if escaped, err := json.Marshal(truncated); err == nil {
+			info.RawData = escaped
+		}
 	}
 
 	acc.mu.Lock()
