@@ -122,11 +122,17 @@ func (c *Config) Sanitize() {
 	if c.HealthCheckConcurrency <= 0 {
 		c.HealthCheckConcurrency = 5
 	}
+	if c.HealthCheckConcurrency > 128 {
+		c.HealthCheckConcurrency = 128
+	}
 	if c.HealthCheckStartDelay < 0 {
 		c.HealthCheckStartDelay = 0
 	}
 	if c.HealthCheckBatchSize < 0 {
 		c.HealthCheckBatchSize = 0
+	}
+	if c.HealthCheckBatchSize > 0 && c.HealthCheckConcurrency > c.HealthCheckBatchSize {
+		c.HealthCheckConcurrency = c.HealthCheckBatchSize
 	}
 	if c.HealthCheckReqTimeout <= 0 {
 		c.HealthCheckReqTimeout = 8

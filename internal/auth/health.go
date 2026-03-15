@@ -85,7 +85,7 @@ func NewHealthChecker(baseURL, proxyURL string, checkInterval int, maxFailures i
 		ForceAttemptHTTP2:     false,
 		TLSNextProto:          map[string]func(string, *tls.Conn) http.RoundTripper{},
 		DisableCompression:    true,
-		TLSClientConfig:       &tls.Config{InsecureSkipVerify: false},
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: false, NextProtos: []string{"http/1.1"}},
 	}
 
 	if proxyURL != "" {

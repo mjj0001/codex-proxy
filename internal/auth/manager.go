@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -97,23 +98,64 @@ func (m *Manager) LoadAccounts() error {
 		return fmt.Errorf("读取账号目录失败: %w", err)
 	}
 
-	accounts := make([]*Account, 0, len(entries))
-	index := make(map[string]*Account, len(entries))
-
+	filePaths := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".json") {
 			continue
 		}
+		filePaths = append(filePaths, filepath.Join(m.authDir, entry.Name()))
+	}
 
-		filePath := filepath.Join(m.authDir, entry.Name())
-		acc, loadErr := loadAccountFromFile(filePath)
-		if loadErr != nil {
-			log.Warnf("加载账号文件失败 [%s]: %v", entry.Name(), loadErr)
+	type loadResult struct {
+		path string
+		acc  *Account
+		err  error
+	}
+
+	workerCount := runtime.GOMAXPROCS(0) * 4
+	if workerCount < 8 {
+		workerCount = 8
+	}
+	if workerCount > 128 {
+		workerCount = 128
+	}
+	if workerCount > len(filePaths) && len(filePaths) > 0 {
+		workerCount = len(filePaths)
+	}
+
+	jobs := make(chan string, workerCount*2)
+	results := make(chan loadResult, workerCount*2)
+	var wg sync.WaitGroup
+
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for p := range jobs {
+				acc, loadErr := loadAccountFromFile(p)
+				results <- loadResult{path: p, acc: acc, err: loadErr}
+			}
+		}()
+	}
+
+	go func() {
+		for _, p := range filePaths {
+			jobs <- p
+		}
+		close(jobs)
+		wg.Wait()
+		close(results)
+	}()
+
+	accounts := make([]*Account, 0, len(filePaths))
+	index := make(map[string]*Account, len(filePaths))
+	for r := range results {
+		if r.err != nil {
+			log.Warnf("加载账号文件失败 [%s]: %v", filepath.Base(r.path), r.err)
 			continue
 		}
-
-		accounts = append(accounts, acc)
-		index[filePath] = acc
+		accounts = append(accounts, r.acc)
+		index[r.path] = r.acc
 	}
 
 	if len(accounts) == 0 {

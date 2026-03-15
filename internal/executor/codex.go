@@ -109,6 +109,7 @@ func NewExecutor(baseURL, proxyURL string, poolCfg HTTPPoolConfig) *Executor {
 	}
 	if !enableHTTP2 {
 		transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+		transport.TLSClientConfig.NextProtos = []string{"http/1.1"}
 	}
 
 	if proxyURL != "" {
@@ -186,7 +187,9 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 			break
 		}
 
+		pickStart := time.Now()
 		account, err := rc.PickFn(model, excluded)
+		pickDur := time.Since(pickStart)
 		if err != nil {
 			if attempt == 0 {
 				return nil, nil, attempt + 1, err
@@ -197,16 +200,21 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 		startAttempt := time.Now()
 		log.Debugf("send attempt %d/%d account=%s model=%s stream=%v", attempt+1, maxAttempts, account.GetEmail(), model, stream)
 
+		buildStart := time.Now()
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(codexBody))
 		if err != nil {
 			return nil, nil, attempt + 1, fmt.Errorf("创建请求失败: %w", err)
 		}
 		applyCodexHeaders(httpReq, account, stream)
+		buildDur := time.Since(buildStart)
 
+		doStart := time.Now()
 		httpResp, err := e.httpClient.Do(httpReq)
+		doDur := time.Since(doStart)
 		if err != nil {
 			account.RecordFailure()
 			lastErr = fmt.Errorf("请求发送失败: %w", err)
+			log.Infof("send stage model=%s account=%s attempt=%d/%d pick=%v build=%v upstream_wait=%v total=%v status=ERR err=%v", model, account.GetEmail(), attempt+1, maxAttempts, pickDur, buildDur, doDur, time.Since(startAttempt), err)
 			if attempt < maxAttempts-1 {
 				log.Warnf("账号 [%s] 网络错误，切换账号重试: %v (elapsed=%v)", account.GetEmail(), err, time.Since(startAttempt).Round(time.Millisecond))
 				continue
@@ -216,6 +224,7 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 
 		/* 2xx 成功 */
 		if httpResp.StatusCode >= 200 && httpResp.StatusCode < 300 {
+			log.Infof("send stage model=%s account=%s attempt=%d/%d pick=%v build=%v upstream_wait=%v total=%v status=%d", model, account.GetEmail(), attempt+1, maxAttempts, pickDur, buildDur, doDur, time.Since(startAttempt), httpResp.StatusCode)
 			log.Debugf("send attempt success status=%d account=%s elapsed=%v", httpResp.StatusCode, account.GetEmail(), time.Since(startAttempt).Round(time.Millisecond))
 			return httpResp, account, attempt + 1, nil
 		}
@@ -232,6 +241,7 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 
 		statusErr := &StatusError{Code: httpResp.StatusCode, Body: errBody}
 		lastErr = statusErr
+		log.Infof("send stage model=%s account=%s attempt=%d/%d pick=%v build=%v upstream_wait=%v total=%v status=%d", model, account.GetEmail(), attempt+1, maxAttempts, pickDur, buildDur, doDur, time.Since(startAttempt), httpResp.StatusCode)
 
 		if !IsRetryableStatus(httpResp.StatusCode) {
 			log.Debugf("send attempt non-retryable status=%d account=%s elapsed=%v", httpResp.StatusCode, account.GetEmail(), time.Since(startAttempt).Round(time.Millisecond))
@@ -291,12 +301,20 @@ func (e *Executor) ExecuteStream(ctx context.Context, rc RetryConfig, requestBod
 	state := translator.NewStreamState(baseModel)
 	scanner := bufio.NewScanner(httpResp.Body)
 	scanner.Buffer(make([]byte, 4*1024), 50*1024*1024)
+	streamStart := time.Now()
+	var firstChunkAt time.Time
+	var completedAt time.Time
+	chunkCount := 0
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		/* 不再调用 extractUsageFromStreamLine，ConvertStreamChunk 内部已提取 usage 到 state */
 		chunks := translator.ConvertStreamChunk(ctx, line, state, reverseToolMap)
 		for _, chunk := range chunks {
+			if firstChunkAt.IsZero() {
+				firstChunkAt = time.Now()
+			}
+			chunkCount++
 			_, _ = writer.Write(sseDataPrefix)
 			_, _ = io.WriteString(writer, chunk)
 			_, _ = writer.Write(sseDataSuffix)
@@ -305,31 +323,66 @@ func (e *Executor) ExecuteStream(ctx context.Context, rc RetryConfig, requestBod
 			}
 		}
 		if state.Completed {
+			if completedAt.IsZero() {
+				completedAt = time.Now()
+			}
 			break
 		}
 	}
 
 	if err = scanner.Err(); err != nil {
 		log.Errorf("读取流式响应失败: %v", err)
-		log.Infof("req summary stream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v (ERR)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
+		firstChunkDur := time.Duration(0)
+		completedDur := time.Duration(0)
+		tailAfterCompleted := time.Duration(0)
+		if !firstChunkAt.IsZero() {
+			firstChunkDur = firstChunkAt.Sub(streamStart)
+		}
+		if !completedAt.IsZero() {
+			completedDur = completedAt.Sub(streamStart)
+			tailAfterCompleted = time.Since(completedAt)
+		}
+		log.Infof("req summary stream model=%s account=%s attempts=%d convert=%v upstream_ttfb=%v first_chunk=%v to_completed=%v tail_after_completed=%v stream=%v chunks=%d total=%v (ERR)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, firstChunkDur, completedDur, tailAfterCompleted, time.Since(streamStart), chunkCount, time.Since(startTotal))
 		return err
 	}
 	if !state.HasText && !state.HasToolCall {
-		log.Infof("req summary stream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v (empty)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
+		firstChunkDur := time.Duration(0)
+		completedDur := time.Duration(0)
+		tailAfterCompleted := time.Duration(0)
+		if !firstChunkAt.IsZero() {
+			firstChunkDur = firstChunkAt.Sub(streamStart)
+		}
+		if !completedAt.IsZero() {
+			completedDur = completedAt.Sub(streamStart)
+			tailAfterCompleted = time.Since(completedAt)
+		}
+		log.Infof("req summary stream model=%s account=%s attempts=%d convert=%v upstream_ttfb=%v first_chunk=%v to_completed=%v tail_after_completed=%v stream=%v chunks=%d total=%v (empty)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, firstChunkDur, completedDur, tailAfterCompleted, time.Since(streamStart), chunkCount, time.Since(startTotal))
 		return ErrEmptyResponse
 	}
 
+	doneWriteStart := time.Now()
 	_, _ = writer.Write(sseDoneMarker)
 	if canFlush {
 		flusher.Flush()
 	}
+	doneWriteDur := time.Since(doneWriteStart)
 
 	/* 从 state 中读取 usage（ConvertStreamChunk 在 response.completed 时已提取） */
 	if state.UsageInput > 0 || state.UsageOutput > 0 {
 		account.RecordUsage(state.UsageInput, state.UsageOutput, state.UsageTotal)
 	}
 	account.RecordSuccess()
-	log.Infof("req summary stream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
+	firstChunkDur := time.Duration(0)
+	completedDur := time.Duration(0)
+	tailAfterCompleted := time.Duration(0)
+	if !firstChunkAt.IsZero() {
+		firstChunkDur = firstChunkAt.Sub(streamStart)
+	}
+	if !completedAt.IsZero() {
+		completedDur = completedAt.Sub(streamStart)
+		tailAfterCompleted = time.Since(completedAt)
+	}
+	log.Infof("req summary stream model=%s account=%s attempts=%d convert=%v upstream_ttfb=%v first_chunk=%v to_completed=%v tail_after_completed=%v done_write=%v stream=%v chunks=%d total=%v", baseModel, account.GetEmail(), attempts, convertDur, sendDur, firstChunkDur, completedDur, tailAfterCompleted, doneWriteDur, time.Since(streamStart), chunkCount, time.Since(startTotal))
 	return nil
 }
 
