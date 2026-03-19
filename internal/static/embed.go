@@ -1,6 +1,6 @@
-package main
+package static
 
 import _ "embed"
 
 //go:embed assets/index.html
-var indexHTML []byte
+var IndexHTML []byte

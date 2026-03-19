@@ -198,50 +198,43 @@ func (h *ProxyHandler) handleHealth(c *gin.Context) {
 }
 
 /**
- * baseModelList 基础模型名列表（与 thinking/suffix.go 中 knownBaseModels 保持一致）
+ * gptModelVersions 列表中的 gpt 主版本段（与上游 id 一致，如 gpt-5.4）
  */
-var baseModelList = []string{
-	"gpt-5", "gpt-5-codex", "gpt-5-codex-mini",
-	"gpt-5.1", "gpt-5.1-codex", "gpt-5.1-codex-mini", "gpt-5.1-codex-max",
-	"gpt-5.2", "gpt-5.2-codex",
-	"gpt-5.3-codex", "gpt-5.3-codex-spark",
-	"gpt-5.4",
-	"codex-mini",
-}
+var gptModelVersions = []string{"gpt-5", "gpt-5.1", "gpt-5.2", "gpt-5.4"}
+var gptModelVariants = []string{"codex", "mini"}
 
 /**
  * thinkingSuffixes 所有可用的思考等级后缀
  */
 var thinkingSuffixes = []string{
-	"low", "medium", "high", "xhigh", "max", "none", "auto",
+	"minimal", "low", "medium", "high", "xhigh", "max", "none", "auto",
 }
 
 /**
  * handleModels 模型列表接口
- * 为每个基础模型自动生成全部思考等级后缀变体和 fast 模式变体
- * 格式：model、model-level、model-fast、model-level-fast
+ * 格式：gpt-{版本}-codex|mini[-{思考等级}][-fast]（codex/mini 为分支，转发上游不省略）
  */
 func (h *ProxyHandler) handleModels(c *gin.Context) {
-	models := make([]gin.H, 0, len(baseModelList)*(2+len(thinkingSuffixes)*2))
+	perCombo := 2 + len(thinkingSuffixes)*2
+	models := make([]gin.H, 0, len(gptModelVersions)*len(gptModelVariants)*perCombo)
 
-	for _, base := range baseModelList {
-		/* 基础模型（无后缀） */
-		models = append(models, gin.H{"id": base, "object": "model", "owned_by": "openai"})
-		/* 基础模型 + fast */
-		models = append(models, gin.H{"id": base + "-fast", "object": "model", "owned_by": "openai"})
-		/* 生成全部思考等级变体 */
-		for _, suffix := range thinkingSuffixes {
-			models = append(models, gin.H{
-				"id":       base + "-" + suffix,
-				"object":   "model",
-				"owned_by": "openai",
-			})
-			/* 思考等级 + fast 组合 */
-			models = append(models, gin.H{
-				"id":       base + "-" + suffix + "-fast",
-				"object":   "model",
-				"owned_by": "openai",
-			})
+	for _, ver := range gptModelVersions {
+		for _, variant := range gptModelVariants {
+			base := ver + "-" + variant
+			models = append(models, gin.H{"id": base, "object": "model", "owned_by": "openai"})
+			models = append(models, gin.H{"id": base + "-fast", "object": "model", "owned_by": "openai"})
+			for _, suffix := range thinkingSuffixes {
+				models = append(models, gin.H{
+					"id":       base + "-" + suffix,
+					"object":   "model",
+					"owned_by": "openai",
+				})
+				models = append(models, gin.H{
+					"id":       base + "-" + suffix + "-fast",
+					"object":   "model",
+					"owned_by": "openai",
+				})
+			}
 		}
 	}
 

@@ -1,21 +1,3 @@
-/**
- * 思考后缀解析模块（逆向解析，不依赖模型白名单）
- * 从模型名尾部向前逐个识别已知后缀并剥离，剩余部分即为真实模型名
- *
- * 解析顺序（从右到左）：
- *   1. -fast → 服务层级 service_tier="priority"（Priority 处理队列）
- *   2. -high/-low/-medium 等 → 思考等级 reasoning.effort
- *   3. -12345 → 数字 token 预算
- *   4. 剩余部分 → 真实模型名（直接转发给上游）
- *
- * 示例：
- *   - "gpt-5.4" → model="gpt-5.4"
- *   - "gpt-5.4-high" → model="gpt-5.4", thinking=high
- *   - "gpt-5.4-fast" → model="gpt-5.4", service_tier=priority
- *   - "gpt-5.4-high-fast" → model="gpt-5.4", thinking=high, service_tier=priority
- *   - "any-new-model-xhigh-fast" → model="any-new-model", thinking=xhigh, service_tier=priority
- *   - "o4-mini-low" → model="o4-mini", thinking=low
- */
 package thinking
 
 import (

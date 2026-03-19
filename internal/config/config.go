@@ -64,6 +64,14 @@ type Config struct {
 	RefreshBatchSize         int      `yaml:"refresh-batch-size"`
 	Accounts                 []string `yaml:"accounts"`
 	APIKeys                  []string `yaml:"api-keys"`
+
+	/* 入站 HTTP/2 (h2c) 等 */
+	EnableListenH2C            bool `yaml:"enable-listen-h2c"`
+	ListenReadHeaderTimeoutSec int  `yaml:"listen-read-header-timeout-sec"`
+	ListenIdleTimeoutSec       int  `yaml:"listen-idle-timeout-sec"`
+	ListenTCPKeepaliveSec      int  `yaml:"listen-tcp-keepalive-sec"`
+	ListenMaxHeaderBytes       int  `yaml:"listen-max-header-bytes"`
+	H2MaxConcurrentStreams     int  `yaml:"h2-max-concurrent-streams"`
 }
 
 /**
@@ -79,40 +87,46 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	cfg := &Config{
-		Listen:                   ":8080",
-		AuthDir:                  "./auths",
-		BackendDomain:            "",
-		BaseURL:                  "",
-		LogLevel:                 "info",
-		RefreshInterval:          3000,
-		MaxRetry:                 2,
-		HealthCheckInterval:      300,
-		HealthCheckMaxFailures:   3,
-		HealthCheckConcurrency:   5,
-		HealthCheckStartDelay:    45,
-		HealthCheckBatchSize:     20,
-		HealthCheckReqTimeout:    8,
-		RefreshConcurrency:       50,
-		MaxConnsPerHost:          512,
-		MaxIdleConns:             1024,
-		MaxIdleConnsPerHost:      512,
-		EnableHTTP2:              true,
-		StartupAsyncLoad:         true,
-		StartupLoadRetryInterval: 10,
-		ShutdownTimeout:          5,
-		AuthScanInterval:         30,
-		SaveWorkers:              4,
-		Cooldown401Sec:           30,
-		Cooldown429Sec:           60,
-		RefreshSingleTimeoutSec:  30,
-		QuotaCheckConcurrency:    0, /* 0 表示使用 refresh-concurrency */
-		KeepaliveInterval:        60,
-		UpstreamTimeoutSec:       0,
-		StreamIdleTimeoutSec:     0,
-		EmptyRetryMax:            2,
-		EnableStreamIdleRetry:    true,
-		Selector:                 "round-robin",
-		RefreshBatchSize:         0,
+		Listen:                     ":8080",
+		AuthDir:                    "./auths",
+		BackendDomain:              "",
+		BaseURL:                    "",
+		LogLevel:                   "info",
+		RefreshInterval:            3000,
+		MaxRetry:                   2,
+		HealthCheckInterval:        300,
+		HealthCheckMaxFailures:     3,
+		HealthCheckConcurrency:     5,
+		HealthCheckStartDelay:      45,
+		HealthCheckBatchSize:       20,
+		HealthCheckReqTimeout:      8,
+		RefreshConcurrency:         50,
+		MaxConnsPerHost:            512,
+		MaxIdleConns:               1024,
+		MaxIdleConnsPerHost:        512,
+		EnableHTTP2:                true,
+		StartupAsyncLoad:           true,
+		StartupLoadRetryInterval:   10,
+		ShutdownTimeout:            5,
+		AuthScanInterval:           30,
+		SaveWorkers:                4,
+		Cooldown401Sec:             30,
+		Cooldown429Sec:             60,
+		RefreshSingleTimeoutSec:    30,
+		QuotaCheckConcurrency:      0, /* 0 表示使用 refresh-concurrency */
+		KeepaliveInterval:          60,
+		UpstreamTimeoutSec:         0,
+		StreamIdleTimeoutSec:       0,
+		EmptyRetryMax:              2,
+		EnableStreamIdleRetry:      true,
+		Selector:                   "round-robin",
+		RefreshBatchSize:           0,
+		EnableListenH2C:            true,
+		ListenReadHeaderTimeoutSec: 60,
+		ListenIdleTimeoutSec:       180,
+		ListenTCPKeepaliveSec:      30,
+		ListenMaxHeaderBytes:       1 << 20,
+		H2MaxConcurrentStreams:     1000,
 	}
 
 	if err = yaml.Unmarshal(data, cfg); err != nil {
@@ -250,6 +264,33 @@ func (c *Config) Sanitize() {
 	c.Selector = strings.TrimSpace(strings.ToLower(c.Selector))
 	if c.Selector != "quota-first" {
 		c.Selector = "round-robin"
+	}
+	if c.ListenReadHeaderTimeoutSec < 1 {
+		c.ListenReadHeaderTimeoutSec = 60
+	}
+	if c.ListenReadHeaderTimeoutSec > 600 {
+		c.ListenReadHeaderTimeoutSec = 600
+	}
+	if c.ListenIdleTimeoutSec < 0 {
+		c.ListenIdleTimeoutSec = 180
+	}
+	if c.ListenIdleTimeoutSec > 0 && c.ListenIdleTimeoutSec < 30 {
+		c.ListenIdleTimeoutSec = 30
+	}
+	if c.ListenTCPKeepaliveSec < 0 {
+		c.ListenTCPKeepaliveSec = 30
+	}
+	if c.ListenMaxHeaderBytes < 4096 && c.ListenMaxHeaderBytes != 0 {
+		c.ListenMaxHeaderBytes = 4096
+	}
+	if c.H2MaxConcurrentStreams < 0 {
+		c.H2MaxConcurrentStreams = 1000
+	}
+	if c.H2MaxConcurrentStreams > 0 && c.H2MaxConcurrentStreams < 100 {
+		c.H2MaxConcurrentStreams = 100
+	}
+	if c.H2MaxConcurrentStreams > 10000 {
+		c.H2MaxConcurrentStreams = 10000
 	}
 
 	switch c.LogLevel {

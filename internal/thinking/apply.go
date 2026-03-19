@@ -30,19 +30,14 @@ var levelToBudgetMap = map[string]int{
  * ApplyThinking 将思考配置和服务层级应用到请求体
  * 解析模型名中的思考后缀和 -fast 后缀，写入请求 JSON
  *
- * 支持的后缀格式：
- *   - gpt-5.4-high → reasoning.effort = "high"
- *   - gpt-5.4-fast → service_tier = "priority"（OpenAI Priority 层级）
- *   - gpt-5.4-high-fast → reasoning.effort = "high" + service_tier = "priority"
- *
  * @param body - 原始请求体 JSON
  * @param model - 模型名（可能包含思考后缀和/或 -fast 后缀）
  * @returns []byte - 处理后的请求体 JSON
- * @returns string - 去除所有后缀后的真实模型名
+ * @returns string - 去除思考后缀与 -fast 后的基础模型名（含分支）
  */
 func ApplyThinking(body []byte, model string) ([]byte, string) {
 	parsed := ParseModelSuffix(model)
-	baseModel := parsed.ModelName
+	baseModel := strings.TrimSpace(parsed.ModelName)
 
 	var config ThinkingConfig
 	if parsed.HasSuffix {

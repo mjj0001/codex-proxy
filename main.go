@@ -19,9 +19,12 @@ import (
 	"codex-proxy/internal/config"
 	"codex-proxy/internal/executor"
 	"codex-proxy/internal/handler"
+	"codex-proxy/internal/static"
 
 	"github.com/gin-gonic/gin"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 )
 
 /* ANSI 颜色代码 */
@@ -168,13 +171,14 @@ func main() {
 	r.Use(ginLogger())
 
 	/* 注册路由 */
-	proxyHandler := handler.NewProxyHandler(manager, exec, cfg.APIKeys, cfg.MaxRetry, cfg.ProxyURL, cfg.BaseURL, cfg.EnableHTTP2, cfg.BackendDomain, cfg.BackendResolveAddress, cfg.QuotaCheckConcurrency, cfg.UpstreamTimeoutSec, cfg.EmptyRetryMax, cfg.StreamIdleTimeoutSec, cfg.EnableStreamIdleRetry, indexHTML)
+	proxyHandler := handler.NewProxyHandler(manager, exec, cfg.APIKeys, cfg.MaxRetry, cfg.ProxyURL, cfg.BaseURL, cfg.EnableHTTP2, cfg.BackendDomain, cfg.BackendResolveAddress, cfg.QuotaCheckConcurrency, cfg.UpstreamTimeoutSec, cfg.EmptyRetryMax, cfg.StreamIdleTimeoutSec, cfg.EnableStreamIdleRetry, static.IndexHTML)
 	proxyHandler.RegisterRoutes(r)
 
-	/* 使用 http.Server 以支持优雅关闭 */
+	/* HTTP/2 明文 (h2c)：单连接多路复用；未升级的客户端仍走 HTTP/1.1 */
+	h2s := &http2.Server{}
 	srv := &http.Server{
 		Addr:    cfg.Listen,
-		Handler: r,
+		Handler: h2c.NewHandler(r, h2s),
 	}
 
 	/* 在 goroutine 中启动 HTTP 服务 */
