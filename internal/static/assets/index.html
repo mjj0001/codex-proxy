@@ -263,6 +263,16 @@
       font-size: 14px;
       background: #fff;
     }
+    .login-card input.invalid {
+      border-color: #d92d20;
+      box-shadow: 0 0 0 3px rgba(217, 45, 32, 0.12);
+    }
+    .login-error {
+      min-height: 20px;
+      margin: -4px 0 0;
+      color: #b42318;
+      font-size: 13px;
+    }
     .login-actions {
       display: flex;
       gap: 10px;
@@ -394,6 +404,7 @@
           <label for="tokenInput">Bearer Token</label>
           <input id="tokenInput" type="text" placeholder="输入访问 Token" />
         </div>
+        <p id="loginError" class="login-error" role="alert"></p>
         <div class="login-actions">
           <button id="saveCredentialsBtn">保存并加载</button>
           <button id="cancelCredentialsBtn" class="ghost">取消</button>
@@ -403,7 +414,7 @@
   </div>
 
   <script>
-    const CACHE_KEY = "stats_cache_v1";
+    const CACHE_KEY = "stats_cache_v2";
     const CRED_KEY = "stats_credentials_v1";
 
     const els = {
@@ -425,17 +436,21 @@
       loginOverlay: document.getElementById("loginOverlay"),
       apiInput: document.getElementById("apiInput"),
       tokenInput: document.getElementById("tokenInput"),
+      loginError: document.getElementById("loginError"),
       saveCredentialsBtn: document.getElementById("saveCredentialsBtn"),
       cancelCredentialsBtn: document.getElementById("cancelCredentialsBtn"),
       settingsBtn: document.getElementById("settingsBtn")
     };
 
     let cache = null;
-    let filteredAccounts = [];
+    let currentRows = [];
     let currentPage = 1;
     let pageSize = Number(els.pageSize.value);
+    let pagination = null;
     let memoryOnlyCache = false;
     let credentials = null;
+    let searchTimer = 0;
+    let fetchController = null;
 
     function formatNumber(n) {
       return new Intl.NumberFormat("zh-CN").format(n ?? 0);
@@ -507,6 +522,18 @@
       localStorage.setItem(CRED_KEY, JSON.stringify(credentials));
     }
 
+    function setLoginError(message) {
+      const text = (message || "").trim();
+      els.loginError.textContent = text;
+      els.tokenInput.classList.toggle("invalid", Boolean(text));
+    }
+
+    function setLoginSubmitting(isSubmitting) {
+      els.saveCredentialsBtn.disabled = isSubmitting;
+      els.cancelCredentialsBtn.disabled = isSubmitting;
+      els.saveCredentialsBtn.textContent = isSubmitting ? "验证中..." : "保存并加载";
+    }
+
     function getDefaultApiUrl() {
       const origin = window.location.origin || "";
       if (origin && origin !== "null") return `${origin}/stats`;
@@ -521,6 +548,9 @@
         els.apiInput.value = existing?.apiUrl || fallbackUrl;
         els.apiInput.placeholder = fallbackUrl;
         els.tokenInput.value = existing?.token || "";
+      } else {
+        setLoginError("");
+        setLoginSubmitting(false);
       }
     }
 
@@ -544,16 +574,17 @@
       `).join("");
     }
 
-    function renderTablePage() {
-      const total = filteredAccounts.length;
-      const totalPages = Math.max(1, Math.ceil(total / pageSize));
-      currentPage = Math.min(currentPage, totalPages);
-      const start = (currentPage - 1) * pageSize;
-      const end = Math.min(start + pageSize, total);
-      const pageRows = filteredAccounts.slice(start, end);
-
+    function renderTable(rows, pageMeta) {
+      currentRows = rows || [];
+      pagination = pageMeta || null;
+      const total = pagination?.filtered_total ?? currentRows.length;
+      const totalPages = Math.max(1, pagination?.total_pages ?? 1);
+      currentPage = Math.min(Math.max(1, pagination?.page ?? currentPage), totalPages);
+      const hasRows = currentRows.length > 0;
+      const start = hasRows ? ((currentPage - 1) * (pagination?.page_size ?? pageSize)) + 1 : 0;
+      const end = hasRows ? start + currentRows.length - 1 : 0;
       const fragment = document.createDocumentFragment();
-      for (const row of pageRows) {
+      for (const row of currentRows) {
         const tr = document.createElement("tr");
         const usage = row.usage || {};
         tr.innerHTML = `
@@ -572,23 +603,42 @@
       }
       els.tableBody.innerHTML = "";
       els.tableBody.appendChild(fragment);
-
       els.pageInfo.textContent = `${currentPage} / ${totalPages}`;
-      els.rowsInfo.textContent = `${formatNumber(total)} 条记录，当前显示 ${formatNumber(start + 1)}-${formatNumber(end)}`;
+      els.rowsInfo.textContent = total === 0
+        ? "0 条记录"
+        : hasRows
+          ? `${formatNumber(total)} 条记录，当前显示 ${formatNumber(start)}-${formatNumber(end)}`
+          : `${formatNumber(total)} 条记录，当前页无数据`;
       els.prevBtn.disabled = currentPage === 1;
       els.nextBtn.disabled = currentPage === totalPages;
     }
 
-    function applyFilter() {
+    function normalizeResponseData(data) {
+      if (data?.pagination) return data;
+      const allRows = Array.isArray(data?.accounts) ? data.accounts : [];
       const kw = els.searchInput.value.trim().toLowerCase();
-      const accounts = cache?.data?.accounts || [];
-      if (!kw) {
-        filteredAccounts = accounts;
-      } else {
-        filteredAccounts = accounts.filter(a => (a.email || "").toLowerCase().includes(kw));
-      }
-      currentPage = 1;
-      renderTablePage();
+      const filteredRows = kw
+        ? allRows.filter(row => (row.email || "").toLowerCase().includes(kw))
+        : allRows;
+      const totalPages = Math.max(1, Math.ceil(filteredRows.length / pageSize));
+      const page = Math.min(currentPage, totalPages);
+      const start = (page - 1) * pageSize;
+      const pageRows = filteredRows.slice(start, start + pageSize);
+      return {
+        summary: data?.summary || {},
+        accounts: pageRows,
+        pagination: {
+          page,
+          page_size: pageSize,
+          total: allRows.length,
+          filtered_total: filteredRows.length,
+          total_pages: totalPages,
+          returned: pageRows.length,
+          has_prev: page > 1,
+          has_next: page < totalPages,
+          query: kw
+        }
+      };
     }
 
     function setLoading(isLoading) {
@@ -608,37 +658,116 @@
         els.pageInfo.textContent = "1 / 1";
         els.prevBtn.disabled = true;
         els.nextBtn.disabled = true;
+        pagination = null;
+        currentRows = [];
       }
+    }
+
+    function buildStatsUrl(apiUrl) {
+      let url;
+      try {
+        url = new URL(apiUrl, window.location.href);
+      } catch (err) {
+        throw new Error("接口地址无效");
+      }
+      url.searchParams.set("page", String(currentPage));
+      url.searchParams.set("page_size", String(pageSize));
+      url.searchParams.set("include_quota", "0");
+      const kw = els.searchInput.value.trim();
+      if (kw) {
+        url.searchParams.set("q", kw);
+      } else {
+        url.searchParams.delete("q");
+      }
+      return url.toString();
+    }
+
+    async function buildRequestError(res) {
+      let message = `HTTP ${res.status}`;
+      let code = "";
+      try {
+        const payload = await res.clone().json();
+        message = payload?.error?.message || payload?.message || message;
+        code = payload?.error?.code || payload?.code || "";
+      } catch (err) {
+        const text = (await res.text()).trim();
+        if (text) {
+          message = text;
+        }
+      }
+      const requestError = new Error(message);
+      requestError.status = res.status;
+      requestError.code = code;
+      return requestError;
+    }
+
+    function isCredentialError(err) {
+      return err?.status === 401 || err?.status === 403 || err?.code === "invalid_api_key";
+    }
+
+    async function requestStats(cred, signal) {
+      if (!cred?.apiUrl) {
+        throw new Error("请输入 API 地址");
+      }
+      const headers = {};
+      if (cred.token) headers.Authorization = `Bearer ${cred.token}`;
+      const res = await fetch(buildStatsUrl(cred.apiUrl), {
+        method: "GET",
+        headers,
+        signal
+      });
+      if (!res.ok) {
+        throw await buildRequestError(res);
+      }
+      return normalizeResponseData(await res.json());
+    }
+
+    function applyStatsData(data) {
+      const cachedAt = new Date().toLocaleString("zh-CN");
+      setCache(data, { cachedAt });
+      render(data);
     }
 
     async function fetchStats() {
       els.cacheState.textContent = "缓存：加载中...";
+      els.cacheNote.textContent = "";
       setLoading(true);
+      if (fetchController) fetchController.abort();
+      const controller = new AbortController();
+      fetchController = controller;
       try {
         const cred = getCredentials();
         if (!cred?.apiUrl) {
+          setLoginError("");
           showLogin(true);
           return;
         }
-        const headers = {};
-        if (cred.token) headers.Authorization = `Bearer ${cred.token}`;
-        const res = await fetch(cred.apiUrl, { method: "GET", headers });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-        const cachedAt = new Date().toLocaleString("zh-CN");
-        setCache(data, { cachedAt });
-        render(data);
+        const data = await requestStats(cred, controller.signal);
+        applyStatsData(data);
+        setLoginError("");
       } catch (err) {
-        if (!cache) showPlaceholder(true);
+        if (err?.name === "AbortError") return;
+        const message = err?.message || "未知错误";
+        els.cacheNote.textContent = `加载失败：${message}`;
+        if (isCredentialError(err)) {
+          showLogin(true);
+          setLoginError(message);
+        }
+        if (!cache) {
+          showPlaceholder(true);
+        }
       } finally {
-        setLoading(false);
+        if (fetchController === controller) {
+          fetchController = null;
+          setLoading(false);
+        }
       }
     }
 
     function render(data) {
-      renderSummary(data.summary, data.accounts || []);
-      filteredAccounts = data.accounts || [];
-      applyFilter();
+      const normalized = normalizeResponseData(data);
+      renderSummary(normalized.summary, normalized.accounts || []);
+      renderTable(normalized.accounts || [], normalized.pagination || null);
       showPlaceholder(false);
       updateCacheBadge();
     }
@@ -658,15 +787,17 @@
     els.pageSize.addEventListener("change", () => {
       pageSize = Number(els.pageSize.value);
       currentPage = 1;
-      renderTablePage();
+      fetchStats();
     });
     els.prevBtn.addEventListener("click", () => {
-      currentPage = Math.max(1, currentPage - 1);
-      renderTablePage();
+      if (currentPage <= 1) return;
+      currentPage -= 1;
+      fetchStats();
     });
     els.nextBtn.addEventListener("click", () => {
+      if (pagination && currentPage >= (pagination.total_pages || 1)) return;
       currentPage += 1;
-      renderTablePage();
+      fetchStats();
     });
     els.refreshBtn.addEventListener("click", () => {
       clearCache();
@@ -678,23 +809,53 @@
       showPlaceholder(true);
     });
     els.settingsBtn.addEventListener("click", () => {
+      setLoginError("");
       showLogin(true);
     });
-    els.saveCredentialsBtn.addEventListener("click", () => {
+    els.saveCredentialsBtn.addEventListener("click", async () => {
       const apiUrl = els.apiInput.value.trim();
       const token = els.tokenInput.value.trim();
-      if (!apiUrl) return;
-      saveCredentials(apiUrl, token);
-      showLogin(false);
-      clearCache();
-      showPlaceholder(true);
-      fetchStats();
+      if (!apiUrl) {
+        setLoginError("请输入 API 地址");
+        return;
+      }
+      els.cacheNote.textContent = "";
+      setLoginError("");
+      setLoginSubmitting(true);
+      setLoading(true);
+      if (fetchController) fetchController.abort();
+      const controller = new AbortController();
+      fetchController = controller;
+      try {
+        const data = await requestStats({ apiUrl, token }, controller.signal);
+        saveCredentials(apiUrl, token);
+        applyStatsData(data);
+        showLogin(false);
+      } catch (err) {
+        if (err?.name === "AbortError") return;
+        const message = err?.message || "未知错误";
+        els.cacheNote.textContent = `加载失败：${message}`;
+        setLoginError(message);
+        if (!cache) {
+          showPlaceholder(true);
+        }
+      } finally {
+        if (fetchController === controller) {
+          fetchController = null;
+          setLoading(false);
+        }
+        setLoginSubmitting(false);
+      }
     });
     els.cancelCredentialsBtn.addEventListener("click", () => {
       showLogin(false);
     });
     els.searchInput.addEventListener("input", () => {
-      applyFilter();
+      window.clearTimeout(searchTimer);
+      searchTimer = window.setTimeout(() => {
+        currentPage = 1;
+        fetchStats();
+      }, 250);
     });
 
     init();

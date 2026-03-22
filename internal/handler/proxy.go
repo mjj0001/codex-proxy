@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,10 +29,23 @@ import (
 
 /* 与 executor 一致的缓冲与扫描器大小，便于统一调优 */
 const (
-	wsBufferSize    = 32 * 1024
-	scannerInitSize = 4 * 1024
-	scannerMaxSize  = 50 * 1024 * 1024
+	wsBufferSize     = 32 * 1024
+	scannerInitSize  = 4 * 1024
+	scannerMaxSize   = 50 * 1024 * 1024
+	statsMaxPageSize = 200
 )
+
+type statsPagination struct {
+	Page          int    `json:"page"`
+	PageSize      int    `json:"page_size"`
+	Total         int    `json:"total"`
+	FilteredTotal int    `json:"filtered_total"`
+	TotalPages    int    `json:"total_pages"`
+	Returned      int    `json:"returned"`
+	HasPrev       bool   `json:"has_prev"`
+	HasNext       bool   `json:"has_next"`
+	Query         string `json:"query,omitempty"`
+}
 
 var responsesWSUpgrader = websocket.FastHTTPUpgrader{
 	ReadBufferSize:  wsBufferSize,
@@ -388,14 +402,55 @@ func (h *ProxyHandler) handleChatCompletions(ctx *fasthttp.RequestCtx) {
  * 返回所有账号的状态、请求数、错误数等统计信息
  */
 func (h *ProxyHandler) handleStats(ctx *fasthttp.RequestCtx) {
+	args := ctx.QueryArgs()
+	pageMode := len(args.Peek("page")) > 0 || len(args.Peek("page_size")) > 0 || len(args.Peek("q")) > 0 || len(args.Peek("include_quota")) > 0
+	query := strings.ToLower(strings.TrimSpace(string(args.Peek("q"))))
+	includeQuota := queryBoolArg(args, "include_quota")
 	accounts := h.manager.GetAccounts()
-	stats := make([]auth.AccountStats, 0, len(accounts))
 	active, cooldown, disabled := 0, 0, 0
 	var totalInputTokens, totalOutputTokens int64
 
+	if !pageMode {
+		stats := make([]auth.AccountStats, 0, len(accounts))
+		for _, acc := range accounts {
+			s := acc.GetStats()
+			stats = append(stats, s)
+			totalInputTokens += s.Usage.InputTokens
+			totalOutputTokens += s.Usage.OutputTokens
+			switch s.Status {
+			case "active":
+				active++
+			case "cooldown":
+				cooldown++
+			case "disabled":
+				disabled++
+			}
+		}
+
+		writeJSON(ctx, fasthttp.StatusOK, map[string]any{
+			"summary": map[string]any{
+				"total":               len(accounts),
+				"active":              active,
+				"cooldown":            cooldown,
+				"disabled":            disabled,
+				"rpm":                 GetRPM(),
+				"total_input_tokens":  totalInputTokens,
+				"total_output_tokens": totalOutputTokens,
+			},
+			"accounts": stats,
+		})
+		return
+	}
+
+	page := parsePositiveIntArg(args, "page", 1, 0)
+	pageSize := parsePositiveIntArg(args, "page_size", 100, statsMaxPageSize)
+	pageStart := (page - 1) * pageSize
+	pageEnd := pageStart + pageSize
+	stats := make([]auth.AccountStats, 0, pageSize)
+	filteredTotal := 0
+
 	for _, acc := range accounts {
 		s := acc.GetStats()
-		stats = append(stats, s)
 		totalInputTokens += s.Usage.InputTokens
 		totalOutputTokens += s.Usage.OutputTokens
 		switch s.Status {
@@ -406,6 +461,25 @@ func (h *ProxyHandler) handleStats(ctx *fasthttp.RequestCtx) {
 		case "disabled":
 			disabled++
 		}
+
+		if query != "" && !strings.Contains(strings.ToLower(s.Email), query) {
+			continue
+		}
+
+		idx := filteredTotal
+		filteredTotal++
+		if idx < pageStart || idx >= pageEnd {
+			continue
+		}
+		if !includeQuota {
+			s.Quota = nil
+		}
+		stats = append(stats, s)
+	}
+
+	totalPages := 1
+	if filteredTotal > 0 {
+		totalPages = (filteredTotal + pageSize - 1) / pageSize
 	}
 
 	writeJSON(ctx, fasthttp.StatusOK, map[string]any{
@@ -419,7 +493,42 @@ func (h *ProxyHandler) handleStats(ctx *fasthttp.RequestCtx) {
 			"total_output_tokens": totalOutputTokens,
 		},
 		"accounts": stats,
+		"pagination": statsPagination{
+			Page:          page,
+			PageSize:      pageSize,
+			Total:         len(accounts),
+			FilteredTotal: filteredTotal,
+			TotalPages:    totalPages,
+			Returned:      len(stats),
+			HasPrev:       page > 1 && filteredTotal > 0,
+			HasNext:       page < totalPages,
+			Query:         query,
+		},
 	})
+}
+
+func parsePositiveIntArg(args *fasthttp.Args, key string, defaultValue, maxValue int) int {
+	raw := strings.TrimSpace(string(args.Peek(key)))
+	if raw == "" {
+		return defaultValue
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value <= 0 {
+		return defaultValue
+	}
+	if maxValue > 0 && value > maxValue {
+		return maxValue
+	}
+	return value
+}
+
+func queryBoolArg(args *fasthttp.Args, key string) bool {
+	switch strings.ToLower(strings.TrimSpace(string(args.Peek(key)))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 /**
