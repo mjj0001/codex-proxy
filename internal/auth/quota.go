@@ -208,6 +208,13 @@ func (qc *QuotaChecker) CheckOne(ctx context.Context, acc *Account) {
 }
 
 /**
+ * CheckAccountResult 查询额度并返回结果码：1=有效，-1=无效，0=失败（网络等）
+ */
+func (qc *QuotaChecker) CheckAccountResult(ctx context.Context, acc *Account) int {
+	return qc.checkAccount(ctx, acc)
+}
+
+/**
  * checkAccount 查询单个账号的额度
  * @param ctx - 上下文
  * @param acc - 账号

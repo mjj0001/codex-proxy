@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -341,7 +342,7 @@ func loadAccountFromFile(filePath string) (*Account, error) {
 		planType = jwtPlan
 	}
 
-	return &Account{
+	acc := &Account{
 		FilePath: filePath,
 		Token: TokenData{
 			IDToken:      tf.IDToken,
@@ -353,7 +354,9 @@ func loadAccountFromFile(filePath string) (*Account, error) {
 			PlanType:     planType,
 		},
 		Status: StatusActive,
-	}, nil
+	}
+	acc.SyncAccessExpireFromToken()
+	return acc, nil
 }
 
 func (m *Manager) loadAccountsFromDB() error {
@@ -405,6 +408,7 @@ func (m *Manager) loadAccountsFromDB() error {
 		if lastRefresh.Valid {
 			acc.lastRefreshMs.Store(lastRefresh.Time.UnixMilli())
 		}
+		acc.SyncAccessExpireFromToken()
 
 		accounts = append(accounts, acc)
 		index[key] = acc
@@ -571,6 +575,45 @@ func (m *Manager) PickExcluding(model string, excluded map[string]bool) (*Accoun
 }
 
 /**
+ * PickRecentlySuccessful 在换号重试仍失败时作为回退：选取最近一次成功完成请求的账号（LastUsedAt 最新）。
+ * 优先选择本轮尚未尝试过的账号；若均已尝试则仍取全局最近成功者。
+ */
+func (m *Manager) PickRecentlySuccessful(model string, excluded map[string]bool) (*Account, error) {
+	_ = model
+	allAccounts := *m.accountsPtr.Load()
+	type cand struct {
+		acc *Account
+		t   time.Time
+	}
+	var list []cand
+	for _, acc := range allAccounts {
+		if AccountStatus(acc.atomicStatus.Load()) == StatusDisabled {
+			continue
+		}
+		t := acc.GetLastUsedAt()
+		if t.IsZero() {
+			continue
+		}
+		list = append(list, cand{acc: acc, t: t})
+	}
+	if len(list) == 0 {
+		return nil, fmt.Errorf("没有可用于回退的最近成功账号")
+	}
+	sort.Slice(list, func(i, j int) bool {
+		if !list[i].t.Equal(list[j].t) {
+			return list[i].t.After(list[j].t)
+		}
+		return list[i].acc.FilePath < list[j].acc.FilePath
+	})
+	for _, c := range list {
+		if excluded == nil || !excluded[c.acc.FilePath] {
+			return c.acc, nil
+		}
+	}
+	return list[0].acc, nil
+}
+
+/**
  * GetAccounts 获取所有账号的只读快照
  * @returns []*Account - 账号列表
  */
@@ -588,6 +631,29 @@ func (m *Manager) GetAccounts() []*Account {
  */
 func (m *Manager) AccountCount() int {
 	return len(*m.accountsPtr.Load())
+}
+
+/**
+ * AccountInPool 判断账号是否仍在号池（用于异步任务中途检测是否已移除）
+ */
+func (m *Manager) AccountInPool(acc *Account) bool {
+	if acc == nil {
+		return false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	_, ok := m.accountIndex[acc.FilePath]
+	return ok
+}
+
+type selectorCacheInvalidator interface {
+	InvalidateAvailableCache()
+}
+
+func (m *Manager) InvalidateSelectorCache() {
+	if inv, ok := m.selector.(selectorCacheInvalidator); ok {
+		inv.InvalidateAvailableCache()
+	}
 }
 
 /**
@@ -622,6 +688,8 @@ func (m *Manager) RemoveAccount(acc *Account, reason string) {
 	remaining := len(m.accounts)
 	m.publishSnapshot()
 	m.mu.Unlock()
+
+	m.InvalidateSelectorCache()
 
 	/* 删除持久化存储 */
 	if m.db != nil {
@@ -906,6 +974,10 @@ func (m *Manager) refreshAllAccountsConcurrent(ctx context.Context) {
 func (m *Manager) filterNeedRefresh(accounts []*Account) []*Account {
 	nowMs := time.Now().UnixMilli()
 	result := make([]*Account, 0, len(accounts)/2)
+	intervalMs := int64(m.refreshInterval) * 1000
+	if intervalMs < 60_000 {
+		intervalMs = 60_000
+	}
 
 	for _, acc := range accounts {
 		/* 正在刷新中，跳过 */
@@ -928,13 +1000,21 @@ func (m *Manager) filterNeedRefresh(accounts []*Account) []*Account {
 			continue
 		}
 
-		/* Token 还有 5 分钟以上有效期，跳过 */
+		tokenOK := false
 		if expire != "" {
 			if expireTime, parseErr := time.Parse(time.RFC3339, expire); parseErr == nil {
-				if time.Until(expireTime) > 5*time.Minute {
-					continue
-				}
+				tokenOK = time.Until(expireTime) > 5*time.Minute
 			}
+		}
+
+		/* 即使 JWT 仍显示有效，超过 refreshInterval 未成功刷新也要纳入本轮，避免长期不刷导致调用时 401 */
+		staleByInterval := false
+		if lastMs := acc.lastRefreshMs.Load(); lastMs == 0 || (nowMs-lastMs) >= intervalMs {
+			staleByInterval = true
+		}
+
+		if tokenOK && !staleByInterval {
+			continue
 		}
 
 		result = append(result, acc)
@@ -1119,6 +1199,7 @@ func (m *Manager) HandleAuth401(acc *Account) {
 
 	/* 立即设为冷却状态，防止后续请求继续使用该账号 */
 	acc.SetCooldown(time.Duration(m.cooldown401Sec) * time.Second)
+	m.InvalidateSelectorCache()
 	log.Warnf("账号 [%s] 遇到 401，已临时冷却，后台刷新中...", email)
 
 	/* CAS 去重：防止同一账号被多个刷新源同时刷新 */
@@ -1163,8 +1244,100 @@ func (m *Manager) HandleAuth401(acc *Account) {
 
 		/* 刷新成功，更新 Token 并恢复为 active */
 		acc.UpdateToken(*td)
+		if err := m.saveTokenToFile(acc); err != nil {
+			log.Errorf("账号 [%s] 401 后台刷新成功但持久化失败: %v", td.Email, err)
+		}
 		m.enqueueSave(acc)
+		m.InvalidateSelectorCache()
 		log.Infof("账号 [%s] 后台刷新成功，已恢复可用", td.Email)
+	}()
+}
+
+/**
+ * ScheduleUpstream429Recovery 上游 429 后异步：先查额度，未通过则等待 1 小时、刷新 token 再查，仍失败则删号
+ */
+func (m *Manager) ScheduleUpstream429Recovery(_ context.Context, acc *Account, qc *QuotaChecker) {
+	if qc == nil || acc == nil {
+		return
+	}
+	if !acc.upstream429Recovering.CompareAndSwap(0, 1) {
+		return
+	}
+	go func() {
+		defer acc.upstream429Recovering.Store(0)
+		email := acc.GetEmail()
+
+		qctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		r1 := qc.CheckAccountResult(qctx, acc)
+		cancel()
+		if r1 == 1 {
+			return
+		}
+
+		log.Warnf("账号 [%s] 上游 429 后额度查询未成功(r=%d)，1 小时后刷新凭证并重试", email, r1)
+
+		select {
+		case <-time.After(1 * time.Hour):
+		case <-m.stopCh:
+			return
+		}
+
+		if !m.AccountInPool(acc) {
+			return
+		}
+
+		if acc.refreshing.CompareAndSwap(0, 1) {
+			func() {
+				defer acc.refreshing.Store(0)
+				timeoutSec := m.refreshSingleTimeoutSec
+				if timeoutSec < 1 {
+					timeoutSec = defaultRefreshSingleTimeoutSec
+				}
+				rctx, rcancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
+				defer rcancel()
+				acc.mu.RLock()
+				rt := acc.Token.RefreshToken
+				acc.mu.RUnlock()
+				if rt == "" {
+					m.RemoveAccount(acc, ReasonQuotaRecheckFailed)
+					return
+				}
+				td, err := m.refresher.RefreshTokenWithRetry(rctx, rt, 3)
+				if err != nil {
+					if IsRateLimitRefreshErr(err) {
+						acc.SetCooldown(time.Duration(m.cooldown429Sec) * time.Second)
+						m.InvalidateSelectorCache()
+						return
+					}
+					m.RemoveAccount(acc, ReasonQuotaRecheckFailed)
+					return
+				}
+				acc.UpdateToken(*td)
+				if err := m.saveTokenToFile(acc); err != nil {
+					log.Errorf("账号 [%s] 429 恢复刷新后持久化失败: %v", acc.GetEmail(), err)
+				}
+				m.enqueueSave(acc)
+			}()
+		} else {
+			log.Debugf("账号 [%s] 429 恢复：跳过刷新（他处正在刷新）", email)
+		}
+
+		if !m.AccountInPool(acc) {
+			return
+		}
+
+		qctx2, cancel2 := context.WithTimeout(context.Background(), 25*time.Second)
+		r2 := qc.CheckAccountResult(qctx2, acc)
+		cancel2()
+		if r2 != 1 {
+			if m.AccountInPool(acc) {
+				m.RemoveAccount(acc, ReasonQuotaRecheckFailed)
+			}
+			return
+		}
+		acc.SetActive()
+		m.InvalidateSelectorCache()
+		log.Infof("账号 [%s] 429 恢复：额度查询已通过，已恢复可用", acc.GetEmail())
 	}()
 }
 

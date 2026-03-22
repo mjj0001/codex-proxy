@@ -197,7 +197,12 @@ func NewExecutor(baseURL, proxyURL string, poolCfg HTTPPoolConfig) *Executor {
  */
 type RetryConfig struct {
 	PickFn                func(model string, excluded map[string]bool) (*auth.Account, error)
+	HealthyPickFn         func(model string, excluded map[string]bool) (*auth.Account, error)
+	HealthyPickMinAttempt int /* 从第几次尝试起（0-based）改用 HealthyPickFn；0 表示主循环中不用；通常为 max-retry-1 */
+	FallbackRecentPickFn  func(model string, excluded map[string]bool) (*auth.Account, error)
 	On401Fn               func(acc *auth.Account)
+	On429RecoveryFn       func(ctx context.Context, acc *auth.Account)
+	OnAfterUpstreamErrFn  func(acc *auth.Account, statusCode int)
 	MaxRetry              int
 	UpstreamTimeoutSec    int
 	EmptyRetryMax         int
@@ -207,6 +212,9 @@ type RetryConfig struct {
 
 /* 上游 HTTP/2 GOAWAY ENHANCE_YOUR_CALM 时的错误特征，用于日志与提示 */
 const enhanceYourCalmHint = "（上游限流：可调低 max-conns-per-host / max-idle-conns-per-host 或关闭 enable-http2）"
+
+/* errCodexBuildRequest 标记创建上游 HTTP 请求失败，调用方不再换号重试 */
+var errCodexBuildRequest = errors.New("codex: build http request")
 
 /**
  * wrapReadErr 若为 HTTP/2 GOAWAY ENHANCE_YOUR_CALM，附加说明便于排查
@@ -275,18 +283,111 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 		}
 	}()
 
+	trySend := func(account *auth.Account, attemptOneBased, maxLabel int, pickDur time.Duration) (*http.Response, error) {
+		if activeCancel != nil {
+			activeCancel()
+			activeCancel = nil
+		}
+		startAttempt := time.Now()
+		log.Debugf("send attempt %d/%d account=%s model=%s stream=%v", attemptOneBased, maxLabel, account.GetEmail(), model, stream)
+
+		buildStart := time.Now()
+		reqCtx, cancel := contextWithOptionalTimeout(ctx, rc.UpstreamTimeoutSec)
+		activeCancel = cancel
+		httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, apiURL, bytes.NewReader(codexBody))
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", errCodexBuildRequest, err)
+		}
+		applyCodexHeaders(httpReq, account, stream)
+		buildDur := time.Since(buildStart)
+		dialTarget := effectiveDialTarget(httpReq.URL, e.resolveAddr)
+		log.Debugf("upstream request model=%s stream=%v account=%s attempt=%d/%d method=%s url=%s dial_target=%s", model, stream, account.GetEmail(), attemptOneBased, maxLabel, httpReq.Method, httpReq.URL.String(), dialTarget)
+
+		doStart := time.Now()
+		httpResp, err := e.httpClient.Do(httpReq)
+		doDur := time.Since(doStart)
+		if err != nil {
+			account.RecordFailure()
+			netErr := fmt.Errorf("请求发送失败: %w", err)
+			log.Debugf("send stage model=%s account=%s attempt=%d/%d pick=%v build=%v upstream_wait=%v total=%v status=ERR err=%v", model, account.GetEmail(), attemptOneBased, maxLabel, pickDur, buildDur, doDur, time.Since(startAttempt), err)
+			return nil, netErr
+		}
+
+		if httpResp.StatusCode >= 200 && httpResp.StatusCode < 300 {
+			activeCancel = nil
+			log.Debugf("send stage model=%s account=%s attempt=%d/%d pick=%v build=%v upstream_wait=%v total=%v status=%d", model, account.GetEmail(), attemptOneBased, maxLabel, pickDur, buildDur, doDur, time.Since(startAttempt), httpResp.StatusCode)
+			log.Debugf("send attempt success status=%d account=%s elapsed=%v", httpResp.StatusCode, account.GetEmail(), time.Since(startAttempt).Round(time.Millisecond))
+			return httpResp, nil
+		}
+
+		errBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
+		_ = httpResp.Body.Close()
+
+		handleAccountError(account, httpResp.StatusCode, errBody)
+
+		if rc.OnAfterUpstreamErrFn != nil {
+			rc.OnAfterUpstreamErrFn(account, httpResp.StatusCode)
+		}
+
+		if httpResp.StatusCode == 401 && rc.On401Fn != nil {
+			rc.On401Fn(account)
+		}
+
+		if httpResp.StatusCode == 429 && rc.On429RecoveryFn != nil {
+			go rc.On429RecoveryFn(context.Background(), account)
+		}
+
+		statusErr := &StatusError{Code: httpResp.StatusCode, Body: errBody}
+		log.Debugf("send stage model=%s account=%s attempt=%d/%d pick=%v build=%v upstream_wait=%v total=%v status=%d", model, account.GetEmail(), attemptOneBased, maxLabel, pickDur, buildDur, doDur, time.Since(startAttempt), httpResp.StatusCode)
+		return nil, statusErr
+	}
+
+	handleSendErr := func(account *auth.Account, attempt int, err2 error) (done bool, fatal error) {
+		if err2 == nil {
+			return false, nil
+		}
+		if errors.Is(err2, errCodexBuildRequest) {
+			return true, err2
+		}
+		var se *StatusError
+		if errors.As(err2, &se) {
+			lastErr = err2
+			if !IsRetryableStatus(se.Code) {
+				log.Debugf("send attempt non-retryable status=%d account=%s", se.Code, account.GetEmail())
+				return true, se
+			}
+			if attempt < maxAttempts-1 {
+				log.Warnf("账号 [%s] [%d] 切换重试", account.GetEmail(), se.Code)
+				return false, nil
+			}
+			return false, nil
+		}
+		lastErr = err2
+		if attempt < maxAttempts-1 {
+			log.Warnf("账号 [%s] 网络错误，切换账号重试: %v", account.GetEmail(), err2)
+			return false, nil
+		}
+		return false, nil
+	}
+
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if ctx.Err() != nil {
 			break
 		}
 
-		if activeCancel != nil {
-			activeCancel()
-			activeCancel = nil
-		}
-
 		pickStart := time.Now()
-		account, err := rc.PickFn(model, excluded)
+		var account *auth.Account
+		var err error
+		if rc.HealthyPickMinAttempt > 0 && attempt >= rc.HealthyPickMinAttempt && rc.HealthyPickFn != nil {
+			account, err = rc.HealthyPickFn(model, excluded)
+			if err != nil {
+				account, err = rc.PickFn(model, excluded)
+			} else {
+				log.Debugf("选号: 尝试 %d/%d 使用最近成功账号策略 account=%s", attempt+1, maxAttempts, account.GetEmail())
+			}
+		} else {
+			account, err = rc.PickFn(model, excluded)
+		}
 		pickDur := time.Since(pickStart)
 		if err != nil {
 			if attempt == 0 {
@@ -295,63 +396,42 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 			break
 		}
 		excluded[account.FilePath] = true
-		startAttempt := time.Now()
-		log.Debugf("send attempt %d/%d account=%s model=%s stream=%v", attempt+1, maxAttempts, account.GetEmail(), model, stream)
 
-		buildStart := time.Now()
-		reqCtx, cancel := contextWithOptionalTimeout(ctx, rc.UpstreamTimeoutSec)
-		activeCancel = cancel
-		httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, apiURL, bytes.NewReader(codexBody))
-		if err != nil {
-			return nil, nil, attempt + 1, fmt.Errorf("创建请求失败: %w", err)
-		}
-		applyCodexHeaders(httpReq, account, stream)
-		buildDur := time.Since(buildStart)
-		dialTarget := effectiveDialTarget(httpReq.URL, e.resolveAddr)
-		log.Debugf("upstream request model=%s stream=%v account=%s attempt=%d/%d method=%s url=%s dial_target=%s", model, stream, account.GetEmail(), attempt+1, maxAttempts, httpReq.Method, httpReq.URL.String(), dialTarget)
-
-		doStart := time.Now()
-		httpResp, err := e.httpClient.Do(httpReq)
-		doDur := time.Since(doStart)
-		if err != nil {
-			account.RecordFailure()
-			lastErr = fmt.Errorf("请求发送失败: %w", err)
-			log.Debugf("send stage model=%s account=%s attempt=%d/%d pick=%v build=%v upstream_wait=%v total=%v status=ERR err=%v", model, account.GetEmail(), attempt+1, maxAttempts, pickDur, buildDur, doDur, time.Since(startAttempt), err)
-			if attempt < maxAttempts-1 {
-				log.Warnf("账号 [%s] 网络错误，切换账号重试: %v (elapsed=%v)", account.GetEmail(), err, time.Since(startAttempt).Round(time.Millisecond))
-				continue
-			}
-			break
-		}
-
-		if httpResp.StatusCode >= 200 && httpResp.StatusCode < 300 {
-			activeCancel = nil
-			log.Debugf("send stage model=%s account=%s attempt=%d/%d pick=%v build=%v upstream_wait=%v total=%v status=%d", model, account.GetEmail(), attempt+1, maxAttempts, pickDur, buildDur, doDur, time.Since(startAttempt), httpResp.StatusCode)
-			log.Debugf("send attempt success status=%d account=%s elapsed=%v", httpResp.StatusCode, account.GetEmail(), time.Since(startAttempt).Round(time.Millisecond))
+		httpResp, err2 := trySend(account, attempt+1, maxAttempts, pickDur)
+		if err2 == nil {
 			return httpResp, account, attempt + 1, nil
 		}
-
-		errBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
-		_ = httpResp.Body.Close()
-
-		handleAccountError(account, httpResp.StatusCode, errBody)
-
-		if httpResp.StatusCode == 401 && rc.On401Fn != nil {
-			rc.On401Fn(account)
+		done, fatal := handleSendErr(account, attempt, err2)
+		if done {
+			return nil, nil, attempt + 1, fatal
 		}
+	}
 
-		statusErr := &StatusError{Code: httpResp.StatusCode, Body: errBody}
-		lastErr = statusErr
-		log.Debugf("send stage model=%s account=%s attempt=%d/%d pick=%v build=%v upstream_wait=%v total=%v status=%d", model, account.GetEmail(), attempt+1, maxAttempts, pickDur, buildDur, doDur, time.Since(startAttempt), httpResp.StatusCode)
-
-		if !IsRetryableStatus(httpResp.StatusCode) {
-			log.Debugf("send attempt non-retryable status=%d account=%s elapsed=%v", httpResp.StatusCode, account.GetEmail(), time.Since(startAttempt).Round(time.Millisecond))
-			return nil, nil, attempt + 1, statusErr
-		}
-
-		if attempt < maxAttempts-1 {
-			log.Warnf("账号 [%s] [%d] 切换重试 (elapsed=%v)", account.GetEmail(), httpResp.StatusCode, time.Since(startAttempt).Round(time.Millisecond))
-			continue
+	if lastErr != nil && rc.FallbackRecentPickFn != nil && ctx.Err() == nil {
+		if se, ok := lastErr.(*StatusError); ok && !IsRetryableStatus(se.Code) {
+			// 400/403 等不重试、不回退
+		} else {
+			fallbackAcc, perr := rc.FallbackRecentPickFn(model, excluded)
+			if perr == nil && fallbackAcc != nil {
+				log.Warnf("换号均失败，回退最近成功账号再试: %s", fallbackAcc.GetEmail())
+				fbLabel := maxAttempts + 1
+				httpResp, err2 := trySend(fallbackAcc, fbLabel, fbLabel, 0)
+				if err2 == nil {
+					return httpResp, fallbackAcc, fbLabel, nil
+				}
+				if errors.Is(err2, errCodexBuildRequest) {
+					return nil, nil, fbLabel, err2
+				}
+				var se2 *StatusError
+				if errors.As(err2, &se2) {
+					lastErr = err2
+					if !IsRetryableStatus(se2.Code) {
+						return nil, nil, fbLabel, se2
+					}
+				} else {
+					lastErr = err2
+				}
+			}
 		}
 	}
 

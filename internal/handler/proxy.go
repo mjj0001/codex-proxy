@@ -67,6 +67,7 @@ type ProxyHandler struct {
 	executor              *executor.Executor
 	apiKeys               []string
 	maxRetry              int
+	enableHealthyRetry    bool
 	quotaChecker          *auth.QuotaChecker
 	indexHTML             []byte
 	upstreamTimeoutSec    int
@@ -84,7 +85,7 @@ type ProxyHandler struct {
  * @param quotaCheckConcurrency - 额度查询并发数（来自 config）
  * @returns *ProxyHandler - 代理处理器实例
  */
-func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []string, maxRetry int, proxyURL string, baseURL string, enableHTTP2 bool, backendDomain string, backendResolveAddress string, quotaCheckConcurrency int, upstreamTimeoutSec, emptyRetryMax, streamIdleTimeoutSec int, enableStreamIdleRetry bool, indexHTML []byte) *ProxyHandler {
+func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []string, maxRetry int, enableHealthyRetry bool, proxyURL string, baseURL string, enableHTTP2 bool, backendDomain string, backendResolveAddress string, quotaCheckConcurrency int, upstreamTimeoutSec, emptyRetryMax, streamIdleTimeoutSec int, enableStreamIdleRetry bool, indexHTML []byte) *ProxyHandler {
 	if maxRetry < 0 {
 		maxRetry = 0
 	}
@@ -96,6 +97,7 @@ func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []s
 		executor:              exec,
 		apiKeys:               apiKeys,
 		maxRetry:              maxRetry,
+		enableHealthyRetry:    enableHealthyRetry,
 		quotaChecker:          auth.NewQuotaChecker(baseURL, proxyURL, quotaCheckConcurrency, enableHTTP2, backendDomain, backendResolveAddress),
 		indexHTML:             indexHTML,
 		upstreamTimeoutSec:    upstreamTimeoutSec,
@@ -273,17 +275,40 @@ func (h *ProxyHandler) handleModels(ctx *fasthttp.RequestCtx) {
  * @returns executor.RetryConfig - 重试配置
  */
 func (h *ProxyHandler) buildRetryConfig() executor.RetryConfig {
-	return executor.RetryConfig{
+	healthyPick := func(model string, excluded map[string]bool) (*auth.Account, error) {
+		return h.manager.PickRecentlySuccessful(model, excluded)
+	}
+	rc := executor.RetryConfig{
 		PickFn: func(model string, excluded map[string]bool) (*auth.Account, error) {
 			return h.manager.PickExcluding(model, excluded)
 		},
-		On401Fn:               func(acc *auth.Account) { h.manager.HandleAuth401(acc) },
+		On401Fn: func(acc *auth.Account) { h.manager.HandleAuth401(acc) },
+		On429RecoveryFn: func(ctx context.Context, acc *auth.Account) {
+			h.manager.ScheduleUpstream429Recovery(ctx, acc, h.quotaChecker)
+		},
+		OnAfterUpstreamErrFn: func(acc *auth.Account, statusCode int) {
+			if statusCode >= 200 && statusCode < 300 {
+				return
+			}
+			h.manager.InvalidateSelectorCache()
+		},
 		MaxRetry:              h.maxRetry,
 		UpstreamTimeoutSec:    h.upstreamTimeoutSec,
 		EmptyRetryMax:         h.emptyRetryMax,
 		StreamIdleTimeoutSec:  h.streamIdleTimeoutSec,
 		EnableStreamIdleRetry: h.enableStreamIdleRetry,
 	}
+	if h.enableHealthyRetry {
+		rc.HealthyPickFn = healthyPick
+		if h.maxRetry >= 2 {
+			/* 前 max-retry-1 次用常规换号，之后用最近成功账号，减少无效轮询 */
+			rc.HealthyPickMinAttempt = h.maxRetry - 1
+		} else {
+			/* max-retry 为 0/1 时无「切换窗口」，仅在全部常规尝试失败后回退一次 */
+			rc.FallbackRecentPickFn = healthyPick
+		}
+	}
+	return rc
 }
 
 /**
