@@ -73,20 +73,23 @@ func (h *ProxyHandler) executeClaudeStream(ctx *fasthttp.RequestCtx, rc executor
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if rawResp.Body != nil {
-			_ = rawResp.Body.Close()
-		}
-	}()
 
-	/* 只有到这里才开始写 SSE 头（重试在 executor 内部已完成） */
+	/* 只有到这里才开始写 SSE 头（重试在 executor 内部已完成）；Body 须在 StreamWriter 内关闭，避免 defer 早于异步写协程执行 */
 	ctx.Response.Header.Set("Content-Type", "text/event-stream")
 	ctx.Response.Header.Set("Cache-Control", "no-cache")
 	ctx.Response.Header.Set("Connection", "keep-alive")
 	ctx.SetStatusCode(fasthttp.StatusOK)
 
+	/* StreamWriter 内勿使用 RequestCtx（fasthttp 文档）；翻译用 Background，取消/断连由上游 Body 读错误体现 */
+	pumpCtx := context.Background()
 	ctx.SetBodyStreamWriter(func(w *bufio.Writer) {
-		writer := newFastHTTPResponseWriter(ctx, w)
+		defer func() {
+			if rawResp.Body != nil {
+				_ = rawResp.Body.Close()
+			}
+		}()
+		sw := newStreamBufWriter(w)
+		flush := func() { _ = w.Flush() }
 		state := translator.NewClaudeStreamState(model)
 
 		scanner := bufio.NewScanner(rawResp.Body)
@@ -94,10 +97,10 @@ func (h *ProxyHandler) executeClaudeStream(ctx *fasthttp.RequestCtx, rc executor
 
 		for scanner.Scan() {
 			line := scanner.Bytes()
-			events := translator.ConvertCodexStreamToClaudeEvents(ctx, line, state)
+			events := translator.ConvertCodexStreamToClaudeEvents(pumpCtx, line, state)
 			for _, event := range events {
-				_, _ = io.WriteString(writer, event)
-				writer.Flush()
+				_, _ = io.WriteString(sw, event)
+				flush()
 			}
 			if state.Completed {
 				break
@@ -105,7 +108,7 @@ func (h *ProxyHandler) executeClaudeStream(ctx *fasthttp.RequestCtx, rc executor
 		}
 
 		if scanErr := scanner.Err(); scanErr != nil {
-			if errors.Is(scanErr, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+			if errors.Is(scanErr, context.Canceled) {
 				return
 			}
 			log.Errorf("Claude 读取流式响应失败: %v", scanErr)
@@ -117,9 +120,9 @@ func (h *ProxyHandler) executeClaudeStream(ctx *fasthttp.RequestCtx, rc executor
 		if !state.Completed {
 			closeEvents := translator.GenerateClaudeCloseEvents(state)
 			for _, event := range closeEvents {
-				_, _ = io.WriteString(writer, event)
+				_, _ = io.WriteString(sw, event)
 			}
-			writer.Flush()
+			flush()
 		}
 		account.RecordSuccess()
 	})
@@ -179,7 +182,7 @@ func (h *ProxyHandler) executeClaudeNonStream(ctx *fasthttp.RequestCtx, rc execu
  */
 func handleClaudeExecutorError(ctx *fasthttp.RequestCtx, err error) {
 	if errors.Is(err, executor.ErrEmptyResponse) {
-		sendClaudeError(ctx, fasthttp.StatusBadRequest, "invalid_response", "empty response")
+		sendClaudeError(ctx, fasthttp.StatusBadGateway, "bad_gateway", "上游未返回有效内容（空响应）")
 		return
 	}
 	if statusErr, ok := err.(*executor.StatusError); ok {

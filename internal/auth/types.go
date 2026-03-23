@@ -134,6 +134,10 @@ const (
 	ReasonRefreshFailed      = "refresh_failed"
 	ReasonHealthCheck        = "health_check_failed"
 	ReasonQuotaRecheckFailed = "quota_recheck_failed"
+	/* ReasonRefresh429 token 刷新接口返回 HTTP 429 */
+	ReasonRefresh429 = "refresh_http_429"
+	/* ReasonQuotaHTTP429 额度查询接口返回 HTTP 429 */
+	ReasonQuotaHTTP429 = "quota_http_429"
 )
 
 /**
@@ -147,6 +151,7 @@ const (
 	Auth401RecoverRefreshed     Auth401RecoverStatus = "refreshed"
 	Auth401RecoverCooldown429OK Auth401RecoverStatus = "cooldown_429_quota_ok"
 	Auth401RecoverDisabled      Auth401RecoverStatus = "disabled"
+	Auth401RecoverRemoved       Auth401RecoverStatus = "removed"
 )
 
 /**

@@ -9,7 +9,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -51,8 +50,6 @@ const (
 	scannerInitSize             = 4 * 1024
 	scannerMaxSize              = 50 * 1024 * 1024
 	defaultKeepaliveIntervalSec = 60
-	/* HTTP/2 下每主机连接数上限，避免上游发送 GOAWAY ENHANCE_YOUR_CALM */
-	maxConnsPerHostHTTP2Cap = 30
 )
 
 type HTTPPoolConfig struct {
@@ -89,11 +86,8 @@ type Executor struct {
 }
 
 /**
- * NewExecutor 创建新的 Codex 执行器
- * 初始化全局连接池，支持高并发场景
- * @param baseURL - API 基础 URL
- * @param proxyURL - 代理地址
- * @returns *Executor - 执行器实例
+ * NewExecutor 创建新的 Codex 执行器（仅用于 /responses 对话转发）
+ * 出站 Dial/Transport/Client 不设超时，避免用户长对话或 SSE 被掐断；健康检查、刷新、额度等走 auth 包独立 Client。
  */
 func NewExecutor(baseURL, proxyURL string, poolCfg HTTPPoolConfig) *Executor {
 	if baseURL == "" {
@@ -112,11 +106,8 @@ func NewExecutor(baseURL, proxyURL string, poolCfg HTTPPoolConfig) *Executor {
 		maxConnsPerHost = 0
 	}
 	enableHTTP2 := poolCfg.EnableHTTP2
-	if enableHTTP2 && maxConnsPerHost > maxConnsPerHostHTTP2Cap {
-		maxConnsPerHost = maxConnsPerHostHTTP2Cap
-	}
 	dialer := &net.Dialer{
-		Timeout:   10 * time.Second,
+		Timeout:   0,
 		KeepAlive: 60 * time.Second,
 	}
 
@@ -140,35 +131,21 @@ func NewExecutor(baseURL, proxyURL string, poolCfg HTTPPoolConfig) *Executor {
 		dialCtx = netutil.BuildResolveDialContext(dialer, poolCfg.BackendDomain, poolCfg.ResolveAddress)
 	}
 
-	transport := &http.Transport{
-		DialContext:           dialCtx,
-		MaxIdleConns:          maxIdleConns,
-		MaxIdleConnsPerHost:   maxIdleConnsPerHost,
-		MaxConnsPerHost:       maxConnsPerHost,
-		IdleConnTimeout:       120 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 20 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		WriteBufferSize:       httpBufferSize,
-		ReadBufferSize:        httpBufferSize,
-		ForceAttemptHTTP2:     enableHTTP2,
-		DisableCompression:    true, /* SSE 流不需要 gzip 解压开销 */
-		TLSClientConfig:       &tls.Config{InsecureSkipVerify: false},
-	}
-	if !enableHTTP2 {
-		transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
-		transport.TLSClientConfig.NextProtos = []string{"http/1.1"}
-	}
-
-	// 设置 HTTP/HTTPS 代理（SOCKS5 已在 DialContext 中处理）
+	transport := netutil.NewUpstreamTransport(netutil.UpstreamTransportConfig{
+		DialContext:         dialCtx,
+		ProxyURL:            proxyURL,
+		MaxIdleConns:        maxIdleConns,
+		MaxIdleConnsPerHost: maxIdleConnsPerHost,
+		MaxConnsPerHost:     maxConnsPerHost,
+		EnableHTTP2:         enableHTTP2,
+		WriteBufferSize:     httpBufferSize,
+		ReadBufferSize:      httpBufferSize,
+		DisableCompression:  true,
+	})
 	if proxyURL != "" {
 		if proxyScheme, err := getProxyScheme(proxyURL); err == nil {
 			if proxyScheme == "http" || proxyScheme == "https" {
-				proxyParsed, err := url.Parse(proxyURL)
-				if err == nil {
-					transport.Proxy = http.ProxyURL(proxyParsed)
-					log.Infof("已启用 HTTP/HTTPS 代理: %s", proxyURL)
-				}
+				log.Infof("已启用 HTTP/HTTPS 代理: %s", proxyURL)
 			}
 		}
 	}
@@ -181,7 +158,7 @@ func NewExecutor(baseURL, proxyURL string, poolCfg HTTPPoolConfig) *Executor {
 		baseURL: strings.TrimSuffix(baseURL, "/"),
 		httpClient: &http.Client{
 			Transport: transport,
-			Timeout:   5 * time.Minute,
+			Timeout:   0, /* 对话 API：不在 Client 层限制整段请求+读 body */
 		},
 		resolveAddr:          strings.TrimSpace(poolCfg.ResolveAddress),
 		keepaliveIntervalSec: keepaliveSec,
@@ -190,10 +167,7 @@ func NewExecutor(baseURL, proxyURL string, poolCfg HTTPPoolConfig) *Executor {
 
 /**
  * RetryConfig 内部重试配置
- * @field UpstreamTimeoutSec - 上游响应超时（秒），0 不限制；超时则换号重试
  * @field EmptyRetryMax - 空返回时最多再重试次数
- * @field StreamIdleTimeoutSec - 流式两包间最大间隔（秒），0 禁用
- * @field EnableStreamIdleRetry - 流式无首包或包间隔过长时是否换号重试
  */
 type RetryConfig struct {
 	PickFn                func(model string, excluded map[string]bool) (*auth.Account, error)
@@ -204,10 +178,7 @@ type RetryConfig struct {
 	On429RecoveryFn       func(ctx context.Context, acc *auth.Account)
 	OnAfterUpstreamErrFn  func(acc *auth.Account, statusCode int)
 	MaxRetry              int
-	UpstreamTimeoutSec    int
 	EmptyRetryMax         int
-	StreamIdleTimeoutSec  int
-	EnableStreamIdleRetry bool
 }
 
 /**
@@ -254,13 +225,6 @@ var errCodexBuildRequest = errors.New("codex: build http request")
 /**
  * wrapReadErr 若为 HTTP/2 GOAWAY ENHANCE_YOUR_CALM，附加说明便于排查
  */
-func contextWithOptionalTimeout(parent context.Context, timeoutSec int) (context.Context, context.CancelFunc) {
-	if timeoutSec > 0 {
-		return context.WithTimeout(parent, time.Duration(timeoutSec)*time.Second)
-	}
-	return parent, func() {}
-}
-
 func wrapReadErr(err error) error {
 	if err == nil {
 		return nil
@@ -311,25 +275,13 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 	excluded := make(map[string]bool)
 	maxAttempts := rc.MaxRetry + 1
 	var lastErr error
-	var activeCancel context.CancelFunc
-	defer func() {
-		if activeCancel != nil {
-			activeCancel()
-		}
-	}()
 
 	trySend := func(account *auth.Account, attemptOneBased, maxLabel int, pickDur time.Duration) (*http.Response, error) {
-		if activeCancel != nil {
-			activeCancel()
-			activeCancel = nil
-		}
 		startAttempt := time.Now()
 		log.Debugf("send attempt %d/%d account=%s model=%s stream=%v", attemptOneBased, maxLabel, account.GetEmail(), model, stream)
 
 		buildStart := time.Now()
-		reqCtx, cancel := contextWithOptionalTimeout(ctx, rc.UpstreamTimeoutSec)
-		activeCancel = cancel
-		httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, apiURL, bytes.NewReader(codexBody))
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(codexBody))
 		if err != nil {
 			return nil, fmt.Errorf("%w: %w", errCodexBuildRequest, err)
 		}
@@ -349,7 +301,6 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 		}
 
 		if httpResp.StatusCode >= 200 && httpResp.StatusCode < 300 {
-			activeCancel = nil
 			log.Debugf("send stage model=%s account=%s attempt=%d/%d pick=%v build=%v upstream_wait=%v total=%v status=%d", model, account.GetEmail(), attemptOneBased, maxLabel, pickDur, buildDur, doDur, time.Since(startAttempt), httpResp.StatusCode)
 			log.Debugf("send attempt success status=%d account=%s elapsed=%v", httpResp.StatusCode, account.GetEmail(), time.Since(startAttempt).Round(time.Millisecond))
 			return httpResp, nil
@@ -399,7 +350,11 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 		}
 		lastErr = err2
 		if attempt < maxAttempts-1 {
-			log.Warnf("账号 [%s] 网络错误，切换账号重试: %v", account.GetEmail(), err2)
+			if netutil.IsRetryableUpstreamNetError(err2) {
+				log.Warnf("账号 [%s] 上游网络错误（可重试），切换账号: %v", account.GetEmail(), err2)
+			} else {
+				log.Warnf("账号 [%s] 网络错误，切换账号重试: %v", account.GetEmail(), err2)
+			}
 			return false, nil
 		}
 		return false, nil
@@ -489,146 +444,21 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
  * @returns error - 执行失败时返回错误
  */
 func (e *Executor) ExecuteStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string, writer http.ResponseWriter) error {
-	startTotal := time.Now()
-	convertStart := time.Now()
-	body, baseModel := thinking.ApplyThinking(requestBody, model)
-	codexBody := translator.ConvertOpenAIRequestToCodex(baseModel, body, true)
-	convertDur := time.Since(convertStart)
-	apiURL := e.baseURL + "/responses"
-
-	sendStart := time.Now()
-	httpResp, account, attempts, err := e.sendWithRetry(ctx, rc, model, apiURL, codexBody, true)
+	s, err := e.OpenCodexResponsesStream(ctx, rc, requestBody, model)
 	if err != nil {
 		return err
 	}
-	sendDur := time.Since(sendStart)
-	defer func() {
-		_ = httpResp.Body.Close()
-	}()
-
-	/* 只有到这里才开始写 SSE 头（重试在上面已完成） */
 	writer.Header().Set("Content-Type", "text/event-stream")
 	writer.Header().Set("Cache-Control", "no-cache")
 	writer.Header().Set("Connection", "keep-alive")
 	writer.WriteHeader(http.StatusOK)
-
-	flusher, canFlush := writer.(http.Flusher)
-	reverseToolMap := translator.BuildReverseToolNameMap(requestBody)
-	state := translator.NewStreamState(baseModel)
-	scanner := bufio.NewScanner(httpResp.Body)
-	scanner.Buffer(make([]byte, scannerInitSize), scannerMaxSize)
-	streamStart := time.Now()
-	var firstChunkAt time.Time
-	var completedAt time.Time
-	chunkCount := 0
-
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		/* 不再调用 extractUsageFromStreamLine，ConvertStreamChunk 内部已提取 usage 到 state */
-		chunks := translator.ConvertStreamChunk(ctx, line, state, reverseToolMap)
-		for _, chunk := range chunks {
-			if firstChunkAt.IsZero() {
-				firstChunkAt = time.Now()
-			}
-			chunkCount++
-			_, _ = writer.Write(sseDataPrefix)
-			_, _ = io.WriteString(writer, chunk)
-			_, _ = writer.Write(sseDataSuffix)
-			if canFlush {
-				flusher.Flush()
-			}
-		}
-		if state.Completed {
-			if completedAt.IsZero() {
-				completedAt = time.Now()
-			}
-			break
-		}
-	}
-
-	if err = scanner.Err(); err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
-			firstChunkDur := time.Duration(0)
-			if !firstChunkAt.IsZero() {
-				firstChunkDur = firstChunkAt.Sub(streamStart)
-			}
-			log.Infof("req summary stream model=%s account=%s attempts=%d convert=%v upstream_ttfb=%v first_chunk=%v to_completed=%v tail_after_completed=%v stream=%v chunks=%d total=%v (canceled)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, firstChunkDur, time.Duration(0), time.Duration(0), time.Since(streamStart), chunkCount, time.Since(startTotal))
-			return nil
-		}
-		log.Errorf("读取流式响应失败: %v", err)
-		firstChunkDur := time.Duration(0)
-		completedDur := time.Duration(0)
-		tailAfterCompleted := time.Duration(0)
-		if !firstChunkAt.IsZero() {
-			firstChunkDur = firstChunkAt.Sub(streamStart)
-		}
-		if !completedAt.IsZero() {
-			completedDur = completedAt.Sub(streamStart)
-			tailAfterCompleted = time.Since(completedAt)
-		}
-		log.Infof("req summary stream model=%s account=%s attempts=%d convert=%v upstream_ttfb=%v first_chunk=%v to_completed=%v tail_after_completed=%v stream=%v chunks=%d total=%v (ERR)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, firstChunkDur, completedDur, tailAfterCompleted, time.Since(streamStart), chunkCount, time.Since(startTotal))
-		return wrapReadErr(err)
-	}
-	if !state.HasText && !state.HasToolCall && !state.HasReasoning {
-		/* 空回答时，标记账号失败以避免后续请求继续使用该账号 */
-		account.RecordFailure()
-		firstChunkDur := time.Duration(0)
-		completedDur := time.Duration(0)
-		tailAfterCompleted := time.Duration(0)
-		if !firstChunkAt.IsZero() {
-			firstChunkDur = firstChunkAt.Sub(streamStart)
-		}
-		if !completedAt.IsZero() {
-			completedDur = completedAt.Sub(streamStart)
-			tailAfterCompleted = time.Since(completedAt)
-		}
-		log.Infof("req summary stream model=%s account=%s attempts=%d convert=%v upstream_ttfb=%v first_chunk=%v to_completed=%v tail_after_completed=%v stream=%v chunks=%d total=%v (empty)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, firstChunkDur, completedDur, tailAfterCompleted, time.Since(streamStart), chunkCount, time.Since(startTotal))
-		return ErrEmptyResponse
-	}
-
-	if !state.Completed {
-		finishReason := "stop"
-		if state.FunctionCallIndex != -1 {
-			finishReason = "tool_calls"
-		}
-		synth := `{"id":"","object":"chat.completion.chunk","created":0,"model":"","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`
-		synth, _ = sjson.Set(synth, "id", state.ResponseID)
-		synth, _ = sjson.Set(synth, "created", state.CreatedAt)
-		synth, _ = sjson.Set(synth, "model", state.Model)
-		synth, _ = sjson.Set(synth, "choices.0.finish_reason", finishReason)
-		chunkCount++
-		_, _ = writer.Write(sseDataPrefix)
-		_, _ = io.WriteString(writer, synth)
-		_, _ = writer.Write(sseDataSuffix)
-		if canFlush {
+	flusher, ok := writer.(http.Flusher)
+	flush := func() {
+		if ok {
 			flusher.Flush()
 		}
 	}
-
-	doneWriteStart := time.Now()
-	_, _ = writer.Write(sseDoneMarker)
-	if canFlush {
-		flusher.Flush()
-	}
-	doneWriteDur := time.Since(doneWriteStart)
-
-	/* 从 state 中读取 usage（ConvertStreamChunk 在 response.completed 时已提取） */
-	if state.UsageInput > 0 || state.UsageOutput > 0 {
-		account.RecordUsage(state.UsageInput, state.UsageOutput, state.UsageTotal)
-	}
-	account.RecordSuccess()
-	firstChunkDur := time.Duration(0)
-	completedDur := time.Duration(0)
-	tailAfterCompleted := time.Duration(0)
-	if !firstChunkAt.IsZero() {
-		firstChunkDur = firstChunkAt.Sub(streamStart)
-	}
-	if !completedAt.IsZero() {
-		completedDur = completedAt.Sub(streamStart)
-		tailAfterCompleted = time.Since(completedAt)
-	}
-	log.Infof("req summary stream model=%s account=%s attempts=%d convert=%v upstream_ttfb=%v first_chunk=%v to_completed=%v tail_after_completed=%v done_write=%v stream=%v chunks=%d total=%v", baseModel, account.GetEmail(), attempts, convertDur, sendDur, firstChunkDur, completedDur, tailAfterCompleted, doneWriteDur, time.Since(streamStart), chunkCount, time.Since(startTotal))
-	return nil
+	return s.PumpChatCompletion(writer, flush)
 }
 
 /**
@@ -727,54 +557,21 @@ func (e *Executor) ExecuteNonStream(ctx context.Context, rc RetryConfig, request
  * @returns error - 执行失败时返回错误
  */
 func (e *Executor) ExecuteResponsesStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string, writer http.ResponseWriter) error {
-	startTotal := time.Now()
-	convertStart := time.Now()
-	body, baseModel := thinking.ApplyThinking(requestBody, model)
-	codexBody := translator.ConvertOpenAIRequestToCodex(baseModel, body, true)
-	convertDur := time.Since(convertStart)
-	apiURL := e.baseURL + "/responses"
-
-	sendStart := time.Now()
-	httpResp, account, attempts, err := e.sendWithRetry(ctx, rc, model, apiURL, codexBody, true)
+	s, err := e.OpenCodexResponsesStream(ctx, rc, requestBody, model)
 	if err != nil {
 		return err
 	}
-	sendDur := time.Since(sendStart)
-	defer func() {
-		_ = httpResp.Body.Close()
-	}()
-
 	writer.Header().Set("Content-Type", "text/event-stream")
 	writer.Header().Set("Cache-Control", "no-cache")
 	writer.Header().Set("Connection", "keep-alive")
 	writer.WriteHeader(http.StatusOK)
-
-	flusher, canFlush := writer.(http.Flusher)
-	buf := make([]byte, httpBufferSize)
-	for {
-		n, readErr := httpResp.Body.Read(buf)
-		if n > 0 {
-			_, _ = writer.Write(buf[:n])
-			if canFlush {
-				flusher.Flush()
-			}
-		}
-		if readErr != nil {
-			if readErr != io.EOF {
-				if errors.Is(readErr, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
-					log.Infof("req summary responses-stream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v (canceled)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
-					return nil
-				}
-				log.Errorf("读取流式响应失败: %v", readErr)
-				log.Infof("req summary responses-stream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v (ERR)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
-				return readErr
-			}
-			break
+	flusher, ok := writer.(http.Flusher)
+	flush := func() {
+		if ok {
+			flusher.Flush()
 		}
 	}
-	account.RecordSuccess()
-	log.Infof("req summary responses-stream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
-	return nil
+	return s.PumpRawSSE(writer, flush)
 }
 
 /**
@@ -875,47 +672,27 @@ func (e *Executor) OpenResponsesStream(ctx context.Context, rc RetryConfig, requ
  */
 func (e *Executor) ExecuteResponsesCompactStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string, writer http.ResponseWriter) error {
 	startTotal := time.Now()
-	convertStart := time.Now()
-	body, baseModel := thinking.ApplyThinking(requestBody, model)
-	codexBody := cleanCompactBody(body, baseModel)
-	convertDur := time.Since(convertStart)
-	apiURL := e.baseURL + "/responses/compact"
-
-	sendStart := time.Now()
-	httpResp, account, attempts, err := e.sendWithRetry(ctx, rc, model, apiURL, codexBody, true)
+	compact, err := e.OpenCodexCompactStream(ctx, rc, requestBody, model)
 	if err != nil {
 		return err
 	}
-	sendDur := time.Since(sendStart)
-	defer func() {
-		_ = httpResp.Body.Close()
-	}()
-
-	/* 透传响应头 */
-	for k, vs := range httpResp.Header {
+	for k, vs := range compact.Resp.Header {
 		for _, v := range vs {
 			writer.Header().Add(k, v)
 		}
 	}
 	writer.WriteHeader(http.StatusOK)
-
-	flusher, canFlush := writer.(http.Flusher)
-	buf := make([]byte, httpBufferSize)
-	for {
-		n, readErr := httpResp.Body.Read(buf)
-		if n > 0 {
-			_, _ = writer.Write(buf[:n])
-			if canFlush {
-				flusher.Flush()
-			}
-		}
-		if readErr != nil {
-			break
+	flusher, ok := writer.(http.Flusher)
+	flush := func() {
+		if ok {
+			flusher.Flush()
 		}
 	}
-
-	account.RecordSuccess()
-	log.Infof("req summary responses-compact-stream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
+	if err := compact.PumpBody(writer, flush); err != nil {
+		return err
+	}
+	compact.Account.RecordSuccess()
+	log.Infof("req summary responses-compact-stream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v", compact.BaseModel, compact.Account.GetEmail(), compact.Attempts, compact.ConvertDur, compact.SendDur, time.Since(startTotal))
 	return nil
 }
 
@@ -957,6 +734,28 @@ func (e *Executor) ExecuteResponsesCompactNonStream(ctx context.Context, rc Retr
 	account.RecordSuccess()
 	log.Infof("req summary responses-compact-nonstream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
 	return data, nil
+}
+
+// OpenCodexCompactStream 打开 /responses/compact 流式上游连接（2xx 后返回，Body 由 PumpBody 关闭）。
+func (e *Executor) OpenCodexCompactStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string) (*CodexCompactStream, error) {
+	convertStart := time.Now()
+	body, baseModel := thinking.ApplyThinking(requestBody, model)
+	codexBody := cleanCompactBody(body, baseModel)
+	convertDur := time.Since(convertStart)
+	apiURL := e.baseURL + "/responses/compact"
+	sendStart := time.Now()
+	httpResp, account, attempts, err := e.sendWithRetry(ctx, rc, model, apiURL, codexBody, true)
+	if err != nil {
+		return nil, err
+	}
+	return &CodexCompactStream{
+		Resp:       httpResp,
+		Account:    account,
+		Attempts:   attempts,
+		BaseModel:  baseModel,
+		ConvertDur: convertDur,
+		SendDur:    time.Since(sendStart),
+	}, nil
 }
 
 /**
@@ -1218,9 +1017,9 @@ func (e *Executor) StartKeepAlive(ctx context.Context) {
  * @param targetURL - 目标 URL
  */
 func (e *Executor) pingUpstream(targetURL string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	/* 保活 ping 非用户对话路径，设短超时避免后台 ticker 堆积 */
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, targetURL, nil)
 	if err != nil {
 		return

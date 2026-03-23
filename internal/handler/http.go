@@ -91,11 +91,8 @@ func (w *fastHTTPResponseWriter) Write(p []byte) (int, error) {
 	if !w.wroteHeader {
 		w.WriteHeader(http.StatusOK)
 	}
-	n, err := w.bufWriter.Write(p)
-	if err == nil {
-		_ = w.bufWriter.Flush()
-	}
-	return n, err
+	/* 不在每次 Write 时 Flush，降低 syscall 与首包后延迟；由调用方 Flusher.Flush 控制 SSE 块刷新 */
+	return w.bufWriter.Write(p)
 }
 
 func (w *fastHTTPResponseWriter) Flush() {
@@ -104,3 +101,16 @@ func (w *fastHTTPResponseWriter) Flush() {
 
 var _ http.Flusher = (*fastHTTPResponseWriter)(nil)
 var _ http.ResponseWriter = (*fastHTTPResponseWriter)(nil)
+
+/* streamBufWriter 仅写 bufio，不触碰 RequestCtx；用于 SetBodyStreamWriter 内写 SSE 体 */
+type streamBufWriter struct {
+	w *bufio.Writer
+}
+
+func newStreamBufWriter(w *bufio.Writer) *streamBufWriter {
+	return &streamBufWriter{w: w}
+}
+
+func (s *streamBufWriter) Write(p []byte) (int, error) {
+	return s.w.Write(p)
+}

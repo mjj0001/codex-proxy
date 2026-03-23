@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -54,6 +55,17 @@ func IsRateLimitRefreshErr(err error) bool {
 		return re.StatusCode == 429
 	}
 	return false
+}
+
+/**
+ * RefreshHTTPStatusFromErr 从刷新错误中提取 HTTP 状态码；非 RefreshError 返回 ok=false
+ */
+func RefreshHTTPStatusFromErr(err error) (statusCode int, ok bool) {
+	var re *RefreshError
+	if errors.As(err, &re) && re.StatusCode > 0 {
+		return re.StatusCode, true
+	}
+	return 0, false
 }
 
 /**

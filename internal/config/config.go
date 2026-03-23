@@ -26,54 +26,62 @@ import (
  * @field APIKeys - 可选的 API 访问密钥，用于保护代理服务
  */
 type Config struct {
-	Listen                   string   `yaml:"listen"`
-	AuthDir                  string   `yaml:"auth-dir"`
-	DBEnabled                bool     `yaml:"db-enabled"`
-	DBDriver                 string   `yaml:"db-driver"`
-	DBHost                   string   `yaml:"db-host"`
-	DBPort                   int      `yaml:"db-port"`
-	DBUser                   string   `yaml:"db-user"`
-	DBPassword               string   `yaml:"db-password"`
-	DBName                   string   `yaml:"db-name"`
-	DBSSLMode                string   `yaml:"db-sslmode"`
-	DBDSN                    string   `yaml:"db-dsn"`
-	ProxyURL                 string   `yaml:"proxy-url"`
-	BackendDomain            string   `yaml:"backend-domain"`
-	BackendResolveAddress    string   `yaml:"backend-resolve-address"`
-	BaseURL                  string   `yaml:"base-url"`
-	LogLevel                 string   `yaml:"log-level"`
-	RefreshInterval          int      `yaml:"refresh-interval"`
-	MaxRetry                 int      `yaml:"max-retry"`
-	EnableHealthyRetry       bool     `yaml:"enable-healthy-retry"`
-	HealthCheckInterval      int      `yaml:"health-check-interval"`
-	HealthCheckMaxFailures   int      `yaml:"health-check-max-failures"`
-	HealthCheckConcurrency   int      `yaml:"health-check-concurrency"`
-	HealthCheckStartDelay    int      `yaml:"health-check-start-delay"`
-	HealthCheckBatchSize     int      `yaml:"health-check-batch-size"`
-	HealthCheckReqTimeout    int      `yaml:"health-check-request-timeout"`
-	RefreshConcurrency       int      `yaml:"refresh-concurrency"`
-	MaxConnsPerHost          int      `yaml:"max-conns-per-host"`
-	MaxIdleConns             int      `yaml:"max-idle-conns"`
-	MaxIdleConnsPerHost      int      `yaml:"max-idle-conns-per-host"`
-	EnableHTTP2              bool     `yaml:"enable-http2"`
-	StartupAsyncLoad         bool     `yaml:"startup-async-load"`
-	StartupLoadRetryInterval int      `yaml:"startup-load-retry-interval"`
-	ShutdownTimeout          int      `yaml:"shutdown-timeout"`
-	AuthScanInterval         int      `yaml:"auth-scan-interval"`
-	SaveWorkers              int      `yaml:"save-workers"`
-	Cooldown401Sec           int      `yaml:"cooldown-401-sec"`
-	Cooldown429Sec           int      `yaml:"cooldown-429-sec"`
-	RefreshSingleTimeoutSec  int      `yaml:"refresh-single-timeout-sec"`
-	QuotaCheckConcurrency    int      `yaml:"quota-check-concurrency"`
-	KeepaliveInterval        int      `yaml:"keepalive-interval"`
-	UpstreamTimeoutSec       int      `yaml:"upstream-timeout-sec"`
-	StreamIdleTimeoutSec     int      `yaml:"stream-idle-timeout-sec"`
-	EmptyRetryMax            int      `yaml:"empty-retry-max"`
-	EnableStreamIdleRetry    bool     `yaml:"enable-stream-idle-retry"`
-	Selector                 string   `yaml:"selector"`
-	RefreshBatchSize         int      `yaml:"refresh-batch-size"`
-	Accounts                 []string `yaml:"accounts"`
-	APIKeys                  []string `yaml:"api-keys"`
+	Listen                 string `yaml:"listen"`
+	AuthDir                string `yaml:"auth-dir"`
+	DBEnabled              bool   `yaml:"db-enabled"`
+	DBDriver               string `yaml:"db-driver"`
+	DBHost                 string `yaml:"db-host"`
+	DBPort                 int    `yaml:"db-port"`
+	DBUser                 string `yaml:"db-user"`
+	DBPassword             string `yaml:"db-password"`
+	DBName                 string `yaml:"db-name"`
+	DBSSLMode              string `yaml:"db-sslmode"`
+	DBDSN                  string `yaml:"db-dsn"`
+	ProxyURL               string `yaml:"proxy-url"`
+	BackendDomain          string `yaml:"backend-domain"`
+	BackendResolveAddress  string `yaml:"backend-resolve-address"`
+	BaseURL                string `yaml:"base-url"`
+	LogLevel               string `yaml:"log-level"`
+	RefreshInterval        int    `yaml:"refresh-interval"`
+	MaxRetry               int    `yaml:"max-retry"`
+	EnableHealthyRetry     bool   `yaml:"enable-healthy-retry"`
+	HealthCheckInterval    int    `yaml:"health-check-interval"`
+	HealthCheckMaxFailures int    `yaml:"health-check-max-failures"`
+	HealthCheckConcurrency int    `yaml:"health-check-concurrency"`
+	HealthCheckStartDelay  int    `yaml:"health-check-start-delay"`
+	HealthCheckBatchSize   int    `yaml:"health-check-batch-size"`
+	/* HealthCheckReqTimeout 定时健康检查单次请求超时（秒），与对话转发无关 */
+	HealthCheckReqTimeout    int  `yaml:"health-check-request-timeout"`
+	RefreshConcurrency       int  `yaml:"refresh-concurrency"`
+	MaxConnsPerHost          int  `yaml:"max-conns-per-host"`
+	MaxIdleConns             int  `yaml:"max-idle-conns"`
+	MaxIdleConnsPerHost      int  `yaml:"max-idle-conns-per-host"`
+	EnableHTTP2              bool `yaml:"enable-http2"`
+	StartupAsyncLoad         bool `yaml:"startup-async-load"`
+	StartupLoadRetryInterval int  `yaml:"startup-load-retry-interval"`
+	ShutdownTimeout          int  `yaml:"shutdown-timeout"`
+	AuthScanInterval         int  `yaml:"auth-scan-interval"`
+	SaveWorkers              int  `yaml:"save-workers"`
+	Cooldown401Sec           int  `yaml:"cooldown-401-sec"`
+	Cooldown429Sec           int  `yaml:"cooldown-429-sec"`
+	/* RefreshSingleTimeoutSec 后台 Token 刷新 / 401 恢复等单次 OAuth 请求超时（秒），与对话 SSE 无关 */
+	RefreshSingleTimeoutSec int `yaml:"refresh-single-timeout-sec"`
+	/* RefreshHTTP429Action 刷新 token 遇 HTTP 429：cooldown | remove | disable（默认 cooldown） */
+	RefreshHTTP429Action string `yaml:"refresh-http-429-action"`
+	/* QuotaHTTP429Action 额度 wham/usage 遇 HTTP 429：cooldown | remove | disable（默认 cooldown） */
+	QuotaHTTP429Action string `yaml:"quota-http-429-action"`
+	/* QuotaHTTPStatusActions 旧式：等价于 quota-http-status-policy 中 phase=none */
+	QuotaHTTPStatusActions map[string]string `yaml:"quota-http-status-actions"`
+	/* RefreshHTTPStatusPolicy 刷新 token 按 HTTP 状态：phase=none|refresh_once|cooldown_then_retry，final=remove|disable|cooldown */
+	RefreshHTTPStatusPolicy map[string]map[string]string `yaml:"refresh-http-status-policy"`
+	QuotaHTTPStatusPolicy   map[string]map[string]string `yaml:"quota-http-status-policy"`
+	QuotaCheckConcurrency   int                          `yaml:"quota-check-concurrency"`
+	KeepaliveInterval       int                          `yaml:"keepalive-interval"`
+	EmptyRetryMax           int                          `yaml:"empty-retry-max"`
+	Selector                string                       `yaml:"selector"`
+	RefreshBatchSize        int                          `yaml:"refresh-batch-size"`
+	Accounts                []string                     `yaml:"accounts"`
+	APIKeys                 []string                     `yaml:"api-keys"`
 
 	/* 入站 HTTP/2 (h2c) 等 */
 	EnableListenH2C            bool `yaml:"enable-listen-h2c"`
@@ -121,10 +129,10 @@ func LoadConfig(path string) (*Config, error) {
 		HealthCheckBatchSize:       20,
 		HealthCheckReqTimeout:      8,
 		RefreshConcurrency:         50,
-		MaxConnsPerHost:            20, /* HTTP/2 下过高易触发上游 GOAWAY ENHANCE_YOUR_CALM */
-		MaxIdleConns:               50,
-		MaxIdleConnsPerHost:        10,
-		EnableHTTP2:                true,
+		MaxConnsPerHost:            12, /* 配合 HTTP/2 降低 GOAWAY ENHANCE_YOUR_CALM 概率 */
+		MaxIdleConns:               48,
+		MaxIdleConnsPerHost:        8,
+		EnableHTTP2:                false, /* 默认 HTTP/1.1，多连接复用更稳；需 h2 可显式开启 */
 		StartupAsyncLoad:           true,
 		StartupLoadRetryInterval:   10,
 		ShutdownTimeout:            5,
@@ -135,10 +143,7 @@ func LoadConfig(path string) (*Config, error) {
 		RefreshSingleTimeoutSec:    30,
 		QuotaCheckConcurrency:      0, /* 0 表示使用 refresh-concurrency */
 		KeepaliveInterval:          60,
-		UpstreamTimeoutSec:         0,
-		StreamIdleTimeoutSec:       0,
 		EmptyRetryMax:              2,
-		EnableStreamIdleRetry:      true,
 		Selector:                   "round-robin",
 		RefreshBatchSize:           0,
 		EnableListenH2C:            true,
@@ -278,12 +283,6 @@ func (c *Config) Sanitize() {
 	if c.KeepaliveInterval <= 0 {
 		c.KeepaliveInterval = 60
 	}
-	if c.UpstreamTimeoutSec < 0 {
-		c.UpstreamTimeoutSec = 0
-	}
-	if c.StreamIdleTimeoutSec < 0 {
-		c.StreamIdleTimeoutSec = 0
-	}
 	if c.EmptyRetryMax < 0 {
 		c.EmptyRetryMax = 0
 	}
@@ -294,6 +293,21 @@ func (c *Config) Sanitize() {
 	if c.Selector != "quota-first" {
 		c.Selector = "round-robin"
 	}
+	c.RefreshHTTP429Action = strings.TrimSpace(c.RefreshHTTP429Action)
+	c.QuotaHTTP429Action = strings.TrimSpace(c.QuotaHTTP429Action)
+	if len(c.QuotaHTTPStatusActions) > 0 {
+		norm := make(map[string]string, len(c.QuotaHTTPStatusActions))
+		for k, v := range c.QuotaHTTPStatusActions {
+			kk := strings.TrimSpace(k)
+			if kk == "" {
+				continue
+			}
+			norm[kk] = strings.TrimSpace(v)
+		}
+		c.QuotaHTTPStatusActions = norm
+	}
+	c.RefreshHTTPStatusPolicy = normalizeNestedStringMap(c.RefreshHTTPStatusPolicy)
+	c.QuotaHTTPStatusPolicy = normalizeNestedStringMap(c.QuotaHTTPStatusPolicy)
 	if c.ListenReadHeaderTimeoutSec < 1 {
 		c.ListenReadHeaderTimeoutSec = 60
 	}
@@ -332,4 +346,32 @@ func (c *Config) Sanitize() {
 	if err == nil {
 		log.SetLevel(level)
 	}
+}
+
+func normalizeNestedStringMap(m map[string]map[string]string) map[string]map[string]string {
+	if len(m) == 0 {
+		return m
+	}
+	out := make(map[string]map[string]string, len(m))
+	for k, v := range m {
+		kk := strings.TrimSpace(k)
+		if kk == "" || v == nil {
+			continue
+		}
+		inner := make(map[string]string, len(v))
+		for ik, iv := range v {
+			ikk := strings.TrimSpace(ik)
+			if ikk == "" {
+				continue
+			}
+			inner[ikk] = strings.TrimSpace(iv)
+		}
+		if len(inner) > 0 {
+			out[kk] = inner
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }

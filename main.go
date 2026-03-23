@@ -179,6 +179,11 @@ func main() {
 		Cooldown429Sec:          cfg.Cooldown429Sec,
 		RefreshSingleTimeoutSec: cfg.RefreshSingleTimeoutSec,
 		RefreshBatchSize:        cfg.RefreshBatchSize,
+		RefreshHTTP429Action:    cfg.RefreshHTTP429Action,
+		QuotaHTTP429Action:      cfg.QuotaHTTP429Action,
+		QuotaHTTPStatusActions:  cfg.QuotaHTTPStatusActions,
+		RefreshHTTPStatusPolicy: cfg.RefreshHTTPStatusPolicy,
+		QuotaHTTPStatusPolicy:   cfg.QuotaHTTPStatusPolicy,
 	}
 	manager := auth.NewManager(cfg.AuthDir, db, cfg.ProxyURL, cfg.RefreshInterval, selector, cfg.EnableHTTP2, managerOpts)
 	manager.SetRefreshConcurrency(cfg.RefreshConcurrency)
@@ -267,7 +272,7 @@ func main() {
 
 	/* 初始化 HTTP 服务 */
 	r := router.New()
-	proxyHandler := handler.NewProxyHandler(manager, exec, cfg.APIKeys, cfg.MaxRetry, cfg.EnableHealthyRetry, cfg.ProxyURL, cfg.BaseURL, cfg.EnableHTTP2, cfg.BackendDomain, cfg.BackendResolveAddress, cfg.QuotaCheckConcurrency, cfg.UpstreamTimeoutSec, cfg.EmptyRetryMax, cfg.StreamIdleTimeoutSec, cfg.EnableStreamIdleRetry, static.IndexHTML)
+	proxyHandler := handler.NewProxyHandler(manager, exec, cfg.APIKeys, cfg.MaxRetry, cfg.EnableHealthyRetry, cfg.ProxyURL, cfg.BaseURL, cfg.EnableHTTP2, cfg.BackendDomain, cfg.BackendResolveAddress, cfg.QuotaCheckConcurrency, cfg.EmptyRetryMax, static.IndexHTML)
 	proxyHandler.RegisterRoutes(r)
 
 	appHandler := r.Handler
@@ -276,13 +281,23 @@ func main() {
 	appHandler = handler.GzipIfAccepted(appHandler)
 	appHandler = fasthttpLogger(appHandler)
 
+	/* Read/WriteTimeout=0：长 SSE 对话不在服务端掐写回；IdleTimeout 用 listen-idle-timeout-sec，勿与 shutdown-timeout 混用 */
 	srv := &fasthttp.Server{
-		Handler:            appHandler,
-		Name:               "Codex Proxy",
-		DisableKeepalive:   false,
-		IdleTimeout:        time.Duration(cfg.ShutdownTimeout) * time.Second,
-		ReadTimeout:        0,
-		WriteTimeout:       0,
+		Handler:          appHandler,
+		Name:             "Codex Proxy",
+		DisableKeepalive: false,
+		IdleTimeout:      time.Duration(cfg.ListenIdleTimeoutSec) * time.Second,
+		ReadTimeout:      0,
+		WriteTimeout:     0,
+		/* fasthttp 无单独「读头」超时；此处按配置限制单次请求的读（含 body），与 listen-read-header-timeout-sec 语义接近 */
+		HeaderReceived: func(_ *fasthttp.RequestHeader) fasthttp.RequestConfig {
+			return fasthttp.RequestConfig{
+				ReadTimeout: time.Duration(cfg.ListenReadHeaderTimeoutSec) * time.Second,
+			}
+		},
+		TCPKeepalive:       cfg.ListenTCPKeepaliveSec > 0,
+		TCPKeepalivePeriod: time.Duration(cfg.ListenTCPKeepaliveSec) * time.Second,
+		ReadBufferSize:     cfg.ListenMaxHeaderBytes,
 		MaxConnsPerIP:      0,
 		MaxRequestsPerConn: 0,
 	}

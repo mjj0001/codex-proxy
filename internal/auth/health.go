@@ -8,7 +8,6 @@ package auth
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -89,29 +88,16 @@ func NewHealthChecker(baseURL, proxyURL string, checkInterval int, maxFailures i
 	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 60 * time.Second}
 	dialCtx := netutil.BuildResolveDialContext(dialer, backendDomain, resolveAddress)
 	log.Debugf("health checker dial config backend_domain=%s resolve_address=%s base_url=%s", backendDomain, netutil.NormalizeResolveAddress(resolveAddress), baseURL)
-	transport := &http.Transport{
+	transport := netutil.NewUpstreamTransport(netutil.UpstreamTransportConfig{
 		DialContext:           dialCtx,
+		ProxyURL:              proxyURL,
 		MaxIdleConns:          concurrency * 2,
 		MaxIdleConnsPerHost:   concurrency * 2,
 		MaxConnsPerHost:       concurrency * 2,
-		IdleConnTimeout:       120 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
+		EnableHTTP2:           enableHTTP2,
 		ResponseHeaderTimeout: requestTimeout,
-		ForceAttemptHTTP2:     enableHTTP2,
 		DisableCompression:    true,
-		TLSClientConfig:       &tls.Config{InsecureSkipVerify: false},
-	}
-	if !enableHTTP2 {
-		transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
-		transport.TLSClientConfig.NextProtos = []string{"http/1.1"}
-	}
-
-	if proxyURL != "" {
-		proxyParsed, err := url.Parse(proxyURL)
-		if err == nil {
-			transport.Proxy = http.ProxyURL(proxyParsed)
-		}
-	}
+	})
 
 	return &HealthChecker{
 		httpClient: &http.Client{

@@ -7,7 +7,6 @@ package auth
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"io"
 	"net"
@@ -75,29 +74,17 @@ func NewQuotaChecker(baseURL, proxyURL string, concurrency int, enableHTTP2 bool
 	dialCtx := netutil.BuildResolveDialContext(dialer, backendDomain, resolveAddress)
 	log.Debugf("quota checker dial config backend_domain=%s resolve_address=%s usage_url=%s", backendDomain, netutil.NormalizeResolveAddress(resolveAddress), usageURL)
 
-	transport := &http.Transport{
+	transport := netutil.NewUpstreamTransport(netutil.UpstreamTransportConfig{
 		DialContext:           dialCtx,
+		ProxyURL:              proxyURL,
 		MaxIdleConns:          concurrency * 2,
 		MaxIdleConnsPerHost:   concurrency * 2,
 		MaxConnsPerHost:       concurrency * 2,
-		IdleConnTimeout:       120 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
+		EnableHTTP2:           enableHTTP2,
 		ResponseHeaderTimeout: 15 * time.Second,
-		ForceAttemptHTTP2:     enableHTTP2,
+		IdleConnTimeout:       120 * time.Second,
 		DisableCompression:    true,
-		TLSClientConfig:       &tls.Config{InsecureSkipVerify: false},
-	}
-	if !enableHTTP2 {
-		transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
-		transport.TLSClientConfig.NextProtos = []string{"http/1.1"}
-	}
-
-	if proxyURL != "" {
-		proxyParsed, err := url.Parse(proxyURL)
-		if err == nil {
-			transport.Proxy = http.ProxyURL(proxyParsed)
-		}
-	}
+	})
 
 	return &QuotaChecker{
 		httpClient: &http.Client{
@@ -149,20 +136,24 @@ func (qc *QuotaChecker) CheckAllStream(ctx context.Context, manager *Manager) <-
 				defer wg.Done()
 				defer func() { <-sem }()
 
-				result := qc.checkAccount(ctx, a)
+				v, st := qc.checkAccount(ctx, a)
 				email := a.GetEmail()
 
 				cur := int(currentIdx.Add(1))
 				var ok bool
-				switch result {
+				switch v {
 				case 1:
 					validCount.Add(1)
 					ok = true
-				case -1:
-					invalidCount.Add(1)
-					manager.RemoveAccount(a, "quota_invalid")
-				default:
+				case 0:
 					failCount.Add(1)
+				default:
+					manager.ApplyQuotaUsageHTTPOutcome(ctx, qc, a, st, v)
+					if manager.AccountInPool(a) {
+						failCount.Add(1)
+					} else {
+						invalidCount.Add(1)
+					}
 				}
 
 				ch <- ProgressEvent{
@@ -204,23 +195,30 @@ func (qc *QuotaChecker) CheckAllStream(ctx context.Context, manager *Manager) <-
  * @param acc - 账号
  */
 func (qc *QuotaChecker) CheckOne(ctx context.Context, acc *Account) {
-	qc.checkAccount(ctx, acc)
+	_, _ = qc.checkAccount(ctx, acc)
 }
 
 /**
- * CheckAccountResult 查询额度并返回结果码：1=有效，-1=无效，0=失败（网络等）
+ * CheckAccountResult 查询额度并返回结果码：1=有效，-1=无效 4xx，0=失败/5xx 暂态，2=HTTP 429
  */
 func (qc *QuotaChecker) CheckAccountResult(ctx context.Context, acc *Account) int {
+	v, _ := qc.checkAccount(ctx, acc)
+	return v
+}
+
+/**
+ * CheckAccountResultWithStatus 同 CheckAccountResult，并返回上游 HTTP 状态码（网络失败时为 0）
+ */
+func (qc *QuotaChecker) CheckAccountResultWithStatus(ctx context.Context, acc *Account) (verdict int, httpStatus int) {
 	return qc.checkAccount(ctx, acc)
 }
 
 /**
  * checkAccount 查询单个账号的额度
- * @param ctx - 上下文
- * @param acc - 账号
- * @returns int - 1=有效, -1=无效, 0=失败
+ * @returns verdict: 1=有效, -1=无效 4xx（非 429）, 0=网络或 5xx 暂态, 2=HTTP 429
+ * @returns httpStatus 响应状态码，错误时为 0
  */
-func (qc *QuotaChecker) checkAccount(ctx context.Context, acc *Account) int {
+func (qc *QuotaChecker) checkAccount(ctx context.Context, acc *Account) (verdict int, httpStatus int) {
 	acc.mu.RLock()
 	accessToken := acc.Token.AccessToken
 	accountID := acc.Token.AccountID
@@ -228,12 +226,12 @@ func (qc *QuotaChecker) checkAccount(ctx context.Context, acc *Account) int {
 	acc.mu.RUnlock()
 
 	if accessToken == "" {
-		return -1
+		return -1, 0
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, qc.usageURL, nil)
 	if err != nil {
-		return 0
+		return 0, 0
 	}
 
 	req.Header.Set("Authorization", "Bearer "+accessToken)
@@ -248,7 +246,7 @@ func (qc *QuotaChecker) checkAccount(ctx context.Context, acc *Account) int {
 	resp, err := qc.httpClient.Do(req)
 	if err != nil {
 		log.Debugf("账号 [%s] 额度查询网络错误: %v", email, err)
-		return 0
+		return 0, 0
 	}
 	defer func() {
 		_ = resp.Body.Close()
@@ -274,10 +272,10 @@ func (qc *QuotaChecker) checkAccount(ctx context.Context, acc *Account) int {
 		acc.mu.Unlock()
 
 		log.Debugf("账号 [%s] 额度查询成功", email)
-		return 1
+		return 1, 200
 	}
 
-	/* 非 200，账号无效 */
+	/* 非 200 */
 	info.Valid = false
 	if json.Valid(body) {
 		info.RawData = body
@@ -298,5 +296,13 @@ func (qc *QuotaChecker) checkAccount(ctx context.Context, acc *Account) int {
 	acc.mu.Unlock()
 
 	log.Warnf("账号 [%s] 额度查询异常 [%d]", email, resp.StatusCode)
-	return -1
+	st := resp.StatusCode
+	switch {
+	case st == 429:
+		return 2, st
+	case st >= 500:
+		return 0, st
+	default:
+		return -1, st
+	}
 }

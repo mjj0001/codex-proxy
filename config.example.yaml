@@ -43,6 +43,34 @@ log-level: "info"
 # Token 自动刷新间隔（秒）
 refresh-interval: 3000
 
+# 未单独写 refresh-http-status-policy / quota-http-status-policy 时，仍可用简写（仅 phase=none）：
+# refresh-http-429-action: cooldown   # 等价于 429: { phase: none, final: cooldown }
+# quota-http-429-action: cooldown
+# quota-http-status-actions:           # 旧式，等价于各状态 phase=none
+#   "401": disable
+#
+# 按 HTTP 状态码两阶段策略（刷新 token / 额度 wham/usage 分别配置）：
+#   phase: none                 — 直接执行 final
+#   phase: refresh_once         — 先立刻再刷新一次 token（额度场景会先刷 token 再重查 usage）；若仍是同一状态码则执行 final
+#   phase: cooldown_then_retry  — 先按状态等待（401 用 cooldown-401-sec，429 用 cooldown-429-sec）再重试一次；仍同一状态码则执行 final
+#   final: remove | disable | cooldown
+#
+# refresh-http-status-policy:
+#   "401":
+#     phase: refresh_once
+#     final: remove
+#   "429":
+#     phase: cooldown_then_retry
+#     final: remove
+#
+# quota-http-status-policy:
+#   "401":
+#     phase: refresh_once
+#     final: remove
+#   "429":
+#     phase: cooldown_then_retry
+#     final: remove
+
 # 请求失败最大重试次数（切换账号重试，0 表示不重试）
 # 总尝试次数 = max-retry + 1。启用 enable-healthy-retry 且 max-retry>=2 时：
 # 前 (max-retry-1) 次用常规轮询换号，从第 max-retry 次起改用「最近调用成功」的账号，减少无效切换耗时。
@@ -66,7 +94,7 @@ health-check-start-delay: 45
 # 每轮健康检查最多抽查多少个账号（0 表示全量）
 health-check-batch-size: 20
 
-# 单个健康检查请求超时（秒）
+# 定时健康检查单次请求超时（秒）；仅影响后台巡检，不影响对话 API
 health-check-request-timeout: 8
 
 # Token 并发刷新数（2w 账号建议 100-200）
@@ -93,7 +121,7 @@ startup-async-load: true
 # 429 限频后账号冷却时间（秒）
 # cooldown-429-sec: 60
 
-# 单次 Token 刷新请求超时（秒）
+# 后台 OAuth 刷新 / 401 恢复等单次请求超时（秒）；不影响 Codex 对话 SSE
 # refresh-single-timeout-sec: 30
 
 # 额度查询并发数（0 表示使用 refresh-concurrency）
@@ -101,13 +129,6 @@ startup-async-load: true
 
 # 连接池保活 ping 间隔（秒）
 # keepalive-interval: 60
-
-# 上游响应超时（秒），0 不限制；超时则换号重试
-# upstream-timeout-sec: 0
-
-# 流式两包间最大间隔（秒），0 禁用；无首包或包间隔过长时换号重试（可关闭）
-# stream-idle-timeout-sec: 0
-# enable-stream-idle-retry: true
 
 # 空返回时最多再重试次数
 # empty-retry-max: 2
@@ -118,12 +139,12 @@ startup-async-load: true
 # 刷新批大小（0=不分批）；>0 时每批完成后再启下一批，降低大账号数时的内存
 # refresh-batch-size: 0
 
-# 连接池配置（0 表示不限制）
+# 连接池配置；HTTP/2 下单主机连接数过高易触发上游 GOAWAY ENHANCE_YOUR_CALM，宜酌情调低 max-conns-per-host / max-idle-conns-per-host
 max-conns-per-host: 512
 max-idle-conns: 1024
 max-idle-conns-per-host: 512
 
-# 是否启用 HTTP/2（默认 false，避免长 SSE 连接造成队头阻塞）
+# 是否启用出站 HTTP/2（关闭则强制 HTTP/1.1，多连接并行通常更稳）
 enable-http2: false
 
 # 管理类 HTTP 接口（若配置了 api-keys 则需带相同 Key）:

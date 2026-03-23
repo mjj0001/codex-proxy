@@ -63,17 +63,14 @@ var responsesWSUpgrader = websocket.FastHTTPUpgrader{
  * @field maxRetry - 请求失败最大重试次数（切换账号重试）
  */
 type ProxyHandler struct {
-	manager               *auth.Manager
-	executor              *executor.Executor
-	apiKeys               []string
-	maxRetry              int
-	enableHealthyRetry    bool
-	quotaChecker          *auth.QuotaChecker
-	indexHTML             []byte
-	upstreamTimeoutSec    int
-	emptyRetryMax         int
-	streamIdleTimeoutSec  int
-	enableStreamIdleRetry bool
+	manager            *auth.Manager
+	executor           *executor.Executor
+	apiKeys            []string
+	maxRetry           int
+	enableHealthyRetry bool
+	quotaChecker       *auth.QuotaChecker
+	indexHTML          []byte
+	emptyRetryMax      int
 }
 
 /**
@@ -85,7 +82,7 @@ type ProxyHandler struct {
  * @param quotaCheckConcurrency - 额度查询并发数（来自 config）
  * @returns *ProxyHandler - 代理处理器实例
  */
-func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []string, maxRetry int, enableHealthyRetry bool, proxyURL string, baseURL string, enableHTTP2 bool, backendDomain string, backendResolveAddress string, quotaCheckConcurrency int, upstreamTimeoutSec, emptyRetryMax, streamIdleTimeoutSec int, enableStreamIdleRetry bool, indexHTML []byte) *ProxyHandler {
+func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []string, maxRetry int, enableHealthyRetry bool, proxyURL string, baseURL string, enableHTTP2 bool, backendDomain string, backendResolveAddress string, quotaCheckConcurrency int, emptyRetryMax int, indexHTML []byte) *ProxyHandler {
 	if maxRetry < 0 {
 		maxRetry = 0
 	}
@@ -93,17 +90,14 @@ func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []s
 		quotaCheckConcurrency = 50
 	}
 	return &ProxyHandler{
-		manager:               manager,
-		executor:              exec,
-		apiKeys:               apiKeys,
-		maxRetry:              maxRetry,
-		enableHealthyRetry:    enableHealthyRetry,
-		quotaChecker:          auth.NewQuotaChecker(baseURL, proxyURL, quotaCheckConcurrency, enableHTTP2, backendDomain, backendResolveAddress),
-		indexHTML:             indexHTML,
-		upstreamTimeoutSec:    upstreamTimeoutSec,
-		emptyRetryMax:         emptyRetryMax,
-		streamIdleTimeoutSec:  streamIdleTimeoutSec,
-		enableStreamIdleRetry: enableStreamIdleRetry,
+		manager:            manager,
+		executor:           exec,
+		apiKeys:            apiKeys,
+		maxRetry:           maxRetry,
+		enableHealthyRetry: enableHealthyRetry,
+		quotaChecker:       auth.NewQuotaChecker(baseURL, proxyURL, quotaCheckConcurrency, enableHTTP2, backendDomain, backendResolveAddress),
+		indexHTML:          indexHTML,
+		emptyRetryMax:      emptyRetryMax,
 	}
 }
 
@@ -295,11 +289,8 @@ func (h *ProxyHandler) buildRetryConfig() executor.RetryConfig {
 			}
 			h.manager.InvalidateSelectorCache()
 		},
-		MaxRetry:              h.maxRetry,
-		UpstreamTimeoutSec:    h.upstreamTimeoutSec,
-		EmptyRetryMax:         h.emptyRetryMax,
-		StreamIdleTimeoutSec:  h.streamIdleTimeoutSec,
-		EnableStreamIdleRetry: h.enableStreamIdleRetry,
+		MaxRetry:      h.maxRetry,
+		EmptyRetryMax: h.emptyRetryMax,
 	}
 	if h.enableHealthyRetry {
 		rc.HealthyPickFn = healthyPick
@@ -321,7 +312,7 @@ func (h *ProxyHandler) buildRetryConfig() executor.RetryConfig {
  */
 func handleExecutorError(ctx *fasthttp.RequestCtx, err error) {
 	if errors.Is(err, executor.ErrEmptyResponse) {
-		sendError(ctx, fasthttp.StatusBadRequest, "empty response", "invalid_response")
+		sendError(ctx, fasthttp.StatusBadGateway, "上游未返回有效内容（空响应）", "bad_gateway")
 		return
 	}
 	if statusErr, ok := err.(*executor.StatusError); ok {
@@ -397,12 +388,19 @@ func (h *ProxyHandler) handleChatCompletions(ctx *fasthttp.RequestCtx) {
 	rc := h.buildRetryConfig()
 
 	if stream {
-		/* 须等 sendWithRetry 成功后再写 200 与 SSE 头（由 executor 经 ResponseWriter 写入），否则失败后无法向客户端返回真实上游状态码 */
+		up, openErr := h.executor.OpenCodexResponsesStream(ctx, rc, body, model)
+		if openErr != nil {
+			handleExecutorError(ctx, openErr)
+			return
+		}
+		ctx.Response.Header.Set("Content-Type", "text/event-stream")
+		ctx.Response.Header.Set("Cache-Control", "no-cache")
+		ctx.Response.Header.Set("Connection", "keep-alive")
+		ctx.SetStatusCode(fasthttp.StatusOK)
 		ctx.SetBodyStreamWriter(func(w *bufio.Writer) {
-			writer := newFastHTTPResponseWriter(ctx, w)
-			execErr := h.executor.ExecuteStream(ctx, rc, body, model, writer)
-			if execErr != nil {
-				handleExecutorError(ctx, execErr)
+			flush := func() { _ = w.Flush() }
+			if execErr := up.PumpChatCompletion(newStreamBufWriter(w), flush); execErr != nil {
+				log.Errorf("chat stream pump: %v", execErr)
 				return
 			}
 			RecordRequest()
@@ -581,6 +579,7 @@ func (h *ProxyHandler) handleRecoverAuth(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
+	/* 管理接口批量恢复：设上限避免协程永久挂起；与 /v1/chat 等对话流无关 */
 	baseCtx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
 	defer cancel()
 
@@ -691,11 +690,19 @@ func (h *ProxyHandler) handleResponses(ctx *fasthttp.RequestCtx) {
 	rc := h.buildRetryConfig()
 
 	if stream {
+		up, openErr := h.executor.OpenCodexResponsesStream(ctx, rc, body, model)
+		if openErr != nil {
+			handleExecutorError(ctx, openErr)
+			return
+		}
+		ctx.Response.Header.Set("Content-Type", "text/event-stream")
+		ctx.Response.Header.Set("Cache-Control", "no-cache")
+		ctx.Response.Header.Set("Connection", "keep-alive")
+		ctx.SetStatusCode(fasthttp.StatusOK)
 		ctx.SetBodyStreamWriter(func(w *bufio.Writer) {
-			writer := newFastHTTPResponseWriter(ctx, w)
-			execErr := h.executor.ExecuteResponsesStream(ctx, rc, body, model, writer)
-			if execErr != nil {
-				handleExecutorError(ctx, execErr)
+			flush := func() { _ = w.Flush() }
+			if execErr := up.PumpRawSSE(newStreamBufWriter(w), flush); execErr != nil {
+				log.Errorf("responses stream pump: %v", execErr)
 				return
 			}
 			RecordRequest()
@@ -914,13 +921,24 @@ func (h *ProxyHandler) handleResponsesCompact(ctx *fasthttp.RequestCtx) {
 	rc := h.buildRetryConfig()
 
 	if stream {
+		compact, openErr := h.executor.OpenCodexCompactStream(ctx, rc, body, model)
+		if openErr != nil {
+			handleExecutorError(ctx, openErr)
+			return
+		}
+		for k, vs := range compact.Resp.Header {
+			for _, v := range vs {
+				ctx.Response.Header.Add(k, v)
+			}
+		}
+		ctx.SetStatusCode(fasthttp.StatusOK)
 		ctx.SetBodyStreamWriter(func(w *bufio.Writer) {
-			writer := newFastHTTPResponseWriter(ctx, w)
-			execErr := h.executor.ExecuteResponsesCompactStream(ctx, rc, body, model, writer)
-			if execErr != nil {
-				handleExecutorError(ctx, execErr)
+			flush := func() { _ = w.Flush() }
+			if execErr := compact.PumpBody(newStreamBufWriter(w), flush); execErr != nil {
+				log.Errorf("compact stream pump: %v", execErr)
 				return
 			}
+			compact.Account.RecordSuccess()
 			RecordRequest()
 		})
 		return
