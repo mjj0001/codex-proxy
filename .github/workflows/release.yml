@@ -121,6 +121,7 @@ jobs:
           else
             git log "${CURRENT_TAG}" --reverse --pretty=format:'%h %s' > commit_list_plain.txt
           fi
+      # 勿在本 step 使用 if: ${{ secrets.* }}：GitHub 的 job/step 条件表达式不支持 secrets，会报「未识别的命名值 secrets」。用下方 env 注入 + run 内 [ -z "$GH_TOKEN" ] 跳过即可。
       - name: GitHub Copilot CLI 生成发行摘要（可选）
         continue-on-error: true
         env:
