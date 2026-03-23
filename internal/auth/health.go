@@ -277,7 +277,7 @@ func (hc *HealthChecker) checkAccount(ctx context.Context, manager *Manager, acc
 		/* Token 无效，连续失败达到阈值则移除 */
 		failures := acc.RecordFailure()
 		if failures >= hc.maxConsecutiveFailures {
-			manager.RemoveAccount(acc, ReasonAuth401)
+			manager.DisableAccountByRenamingFile(acc, ReasonAuth401)
 		} else {
 			log.Debugf("账号 [%s] 健康检查 401 (第 %d/%d 次)", email, failures, hc.maxConsecutiveFailures)
 		}

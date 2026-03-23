@@ -101,6 +101,12 @@ type Account struct {
 	/* 刷新去重字段 */
 	refreshing    atomic.Int32 /* CAS 标志：0=空闲，1=正在刷新。防止同一账号被重复刷新 */
 	lastRefreshMs atomic.Int64 /* 上次刷新完成时间戳（UnixMilli），用于快速判断是否需要刷新 */
+
+	/* access_token 过期时刻（UnixMilli），0 表示未知；选号时用于排除即将过期的账号 */
+	accessExpireUnixMs atomic.Int64
+
+	/* 上游 429 后的额度恢复流程，防止同一账号堆积多个恢复 goroutine */
+	upstream429Recovering atomic.Int32
 }
 
 /**
@@ -119,13 +125,40 @@ const (
 
 /* 禁用原因编码 */
 const (
-	ReasonNone           = ""
-	ReasonAuth401        = "auth_401"
-	ReasonAuth403        = "auth_403"
-	ReasonQuotaExhausted = "quota_exhausted"
-	ReasonRefreshFailed  = "refresh_failed"
-	ReasonHealthCheck    = "health_check_failed"
+	ReasonNone    = ""
+	ReasonAuth401 = "auth_401"
+	/* ReasonAuth401Disabled 上游 401 且刷新/额度复核均失败，凭据文件已重命名禁用 */
+	ReasonAuth401Disabled    = "auth_401_disabled"
+	ReasonAuth403            = "auth_403"
+	ReasonQuotaExhausted     = "quota_exhausted"
+	ReasonRefreshFailed      = "refresh_failed"
+	ReasonHealthCheck        = "health_check_failed"
+	ReasonQuotaRecheckFailed = "quota_recheck_failed"
 )
+
+/**
+ * Auth401RecoverStatus POST /recover-auth 等「401 恢复」流程的终端状态
+ */
+type Auth401RecoverStatus string
+
+const (
+	Auth401RecoverInvalid       Auth401RecoverStatus = "invalid_input"
+	Auth401RecoverSkippedBusy   Auth401RecoverStatus = "skipped_busy"
+	Auth401RecoverRefreshed     Auth401RecoverStatus = "refreshed"
+	Auth401RecoverCooldown429OK Auth401RecoverStatus = "cooldown_429_quota_ok"
+	Auth401RecoverDisabled      Auth401RecoverStatus = "disabled"
+)
+
+/**
+ * Auth401RecoverResult 单次账号 401 恢复（同步刷新 → 429 则查额度 → 失败则禁用凭据）的结果
+ */
+type Auth401RecoverResult struct {
+	Email      string               `json:"email"`
+	FilePath   string               `json:"file_path,omitempty"`
+	Status     Auth401RecoverStatus `json:"status"`
+	ReasonCode string               `json:"reason_code,omitempty"`
+	Detail     string               `json:"detail,omitempty"`
+}
 
 /**
  * AccountStats 账号统计信息（只读快照）
@@ -232,11 +265,26 @@ func (a *Account) GetEmail() string {
 }
 
 /**
+ * GetLastUsedAt 最近一次成功完成请求的时间（RecordSuccess 更新），零值表示尚无成功记录
+ */
+func (a *Account) GetLastUsedAt() time.Time {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.LastUsedAt
+}
+
+/**
  * UpdateToken 安全更新 Token 数据
  * @param td - 新的 Token 数据
  */
 func (a *Account) UpdateToken(td TokenData) {
 	now := time.Now()
+	var expMs int64
+	if td.Expire != "" {
+		if t, err := time.Parse(time.RFC3339, td.Expire); err == nil {
+			expMs = t.UnixMilli()
+		}
+	}
 	a.mu.Lock()
 	a.Token = td
 	a.LastRefreshedAt = now
@@ -247,6 +295,22 @@ func (a *Account) UpdateToken(td TokenData) {
 	/* 同步更新原子状态 */
 	a.atomicStatus.Store(int32(StatusActive))
 	a.lastRefreshMs.Store(now.UnixMilli())
+	a.accessExpireUnixMs.Store(expMs)
+}
+
+/**
+ * SyncAccessExpireFromToken 根据当前 Token.Expire 刷新 accessExpireUnixMs（加载账号后调用）
+ */
+func (a *Account) SyncAccessExpireFromToken() {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	var expMs int64
+	if a.Token.Expire != "" {
+		if t, err := time.Parse(time.RFC3339, a.Token.Expire); err == nil {
+			expMs = t.UnixMilli()
+		}
+	}
+	a.accessExpireUnixMs.Store(expMs)
 }
 
 /**

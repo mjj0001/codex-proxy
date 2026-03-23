@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -341,7 +342,7 @@ func loadAccountFromFile(filePath string) (*Account, error) {
 		planType = jwtPlan
 	}
 
-	return &Account{
+	acc := &Account{
 		FilePath: filePath,
 		Token: TokenData{
 			IDToken:      tf.IDToken,
@@ -353,7 +354,9 @@ func loadAccountFromFile(filePath string) (*Account, error) {
 			PlanType:     planType,
 		},
 		Status: StatusActive,
-	}, nil
+	}
+	acc.SyncAccessExpireFromToken()
+	return acc, nil
 }
 
 func (m *Manager) loadAccountsFromDB() error {
@@ -405,6 +408,7 @@ func (m *Manager) loadAccountsFromDB() error {
 		if lastRefresh.Valid {
 			acc.lastRefreshMs.Store(lastRefresh.Time.UnixMilli())
 		}
+		acc.SyncAccessExpireFromToken()
 
 		accounts = append(accounts, acc)
 		index[key] = acc
@@ -571,6 +575,46 @@ func (m *Manager) PickExcluding(model string, excluded map[string]bool) (*Accoun
 }
 
 /**
+ * PickRecentlySuccessful 在换号重试仍失败时作为回退：选取最近一次成功完成请求的账号（LastUsedAt 最新）。
+ * 优先选择本轮尚未尝试过的账号；若均已尝试则仍取全局最近成功者。
+ */
+func (m *Manager) PickRecentlySuccessful(model string, excluded map[string]bool) (*Account, error) {
+	_ = model
+	allAccounts := *m.accountsPtr.Load()
+	type cand struct {
+		acc *Account
+		t   time.Time
+	}
+	var list []cand
+	for _, acc := range allAccounts {
+		st := AccountStatus(acc.atomicStatus.Load())
+		if st == StatusDisabled || st == StatusCooldown {
+			continue
+		}
+		t := acc.GetLastUsedAt()
+		if t.IsZero() {
+			continue
+		}
+		list = append(list, cand{acc: acc, t: t})
+	}
+	if len(list) == 0 {
+		return nil, fmt.Errorf("没有可用于回退的最近成功账号")
+	}
+	sort.Slice(list, func(i, j int) bool {
+		if !list[i].t.Equal(list[j].t) {
+			return list[i].t.After(list[j].t)
+		}
+		return list[i].acc.FilePath < list[j].acc.FilePath
+	})
+	for _, c := range list {
+		if excluded == nil || !excluded[c.acc.FilePath] {
+			return c.acc, nil
+		}
+	}
+	return list[0].acc, nil
+}
+
+/**
  * GetAccounts 获取所有账号的只读快照
  * @returns []*Account - 账号列表
  */
@@ -588,6 +632,29 @@ func (m *Manager) GetAccounts() []*Account {
  */
 func (m *Manager) AccountCount() int {
 	return len(*m.accountsPtr.Load())
+}
+
+/**
+ * AccountInPool 判断账号是否仍在号池（用于异步任务中途检测是否已移除）
+ */
+func (m *Manager) AccountInPool(acc *Account) bool {
+	if acc == nil {
+		return false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	_, ok := m.accountIndex[acc.FilePath]
+	return ok
+}
+
+type selectorCacheInvalidator interface {
+	InvalidateAvailableCache()
+}
+
+func (m *Manager) InvalidateSelectorCache() {
+	if inv, ok := m.selector.(selectorCacheInvalidator); ok {
+		inv.InvalidateAvailableCache()
+	}
 }
 
 /**
@@ -623,6 +690,8 @@ func (m *Manager) RemoveAccount(acc *Account, reason string) {
 	m.publishSnapshot()
 	m.mu.Unlock()
 
+	m.InvalidateSelectorCache()
+
 	/* 删除持久化存储 */
 	if m.db != nil {
 		if err := m.deleteAccountFromDB(acc); err != nil {
@@ -637,6 +706,79 @@ func (m *Manager) RemoveAccount(acc *Account, reason string) {
 			log.Warnf("账号 [%s] 已删除（内存+磁盘），原因: %s，剩余 %d 个", email, reason, remaining)
 		}
 	}
+}
+
+/**
+ * DisableAccountByRenamingFile 从号池移除账号；磁盘模式将 JSON 重命名为 *.json.disabled（不再加载），数据库模式等同删除库记录
+ */
+func (m *Manager) DisableAccountByRenamingFile(acc *Account, reason string) {
+	if acc == nil {
+		return
+	}
+	m.mu.Lock()
+	filePath := acc.FilePath
+	email := acc.GetEmail()
+	if _, exists := m.accountIndex[filePath]; !exists {
+		m.mu.Unlock()
+		return
+	}
+	delete(m.accountIndex, filePath)
+	for i, a := range m.accounts {
+		if a.FilePath == filePath {
+			last := len(m.accounts) - 1
+			m.accounts[i] = m.accounts[last]
+			m.accounts = m.accounts[:last]
+			break
+		}
+	}
+	remaining := len(m.accounts)
+	m.publishSnapshot()
+	m.mu.Unlock()
+	m.InvalidateSelectorCache()
+
+	if m.db != nil {
+		if err := m.deleteAccountFromDB(acc); err != nil {
+			log.Errorf("账号 [%s] 禁用（数据库删除）失败: %v", email, err)
+		} else {
+			log.Warnf("账号 [%s] 已从号池移除（数据库），原因: %s，剩余 %d 个", email, reason, remaining)
+		}
+		return
+	}
+
+	dest, err := nextDisabledRenamePath(filePath)
+	if err != nil {
+		log.Errorf("账号 [%s] 生成禁用文件名失败: %v，改为删除原文件", email, err)
+		if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
+			log.Errorf("账号 [%s] 删除凭据文件失败: %v", email, err)
+		}
+		return
+	}
+	if err := os.Rename(filePath, dest); err != nil {
+		log.Errorf("账号 [%s] 禁用重命名失败: %v，尝试删除", email, err)
+		if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
+			log.Errorf("账号 [%s] 删除凭据文件失败: %v", email, err)
+		}
+		return
+	}
+	log.Warnf("账号 [%s] 已禁用: %s -> %s，原因: %s，剩余 %d 个", email, filePath, dest, reason, remaining)
+}
+
+func nextDisabledRenamePath(filePath string) (string, error) {
+	base := filePath + ".disabled"
+	for i := 0; i < 256; i++ {
+		candidate := base
+		if i > 0 {
+			candidate = fmt.Sprintf("%s.%d", base, i)
+		}
+		_, err := os.Stat(candidate)
+		if os.IsNotExist(err) {
+			return candidate, nil
+		}
+		if err != nil {
+			return "", err
+		}
+	}
+	return "", fmt.Errorf("exhausted disabled rename suffixes")
 }
 
 /**
@@ -906,6 +1048,10 @@ func (m *Manager) refreshAllAccountsConcurrent(ctx context.Context) {
 func (m *Manager) filterNeedRefresh(accounts []*Account) []*Account {
 	nowMs := time.Now().UnixMilli()
 	result := make([]*Account, 0, len(accounts)/2)
+	intervalMs := int64(m.refreshInterval) * 1000
+	if intervalMs < 60_000 {
+		intervalMs = 60_000
+	}
 
 	for _, acc := range accounts {
 		/* 正在刷新中，跳过 */
@@ -928,13 +1074,21 @@ func (m *Manager) filterNeedRefresh(accounts []*Account) []*Account {
 			continue
 		}
 
-		/* Token 还有 5 分钟以上有效期，跳过 */
+		tokenOK := false
 		if expire != "" {
 			if expireTime, parseErr := time.Parse(time.RFC3339, expire); parseErr == nil {
-				if time.Until(expireTime) > 5*time.Minute {
-					continue
-				}
+				tokenOK = time.Until(expireTime) > 5*time.Minute
 			}
+		}
+
+		/* 即使 JWT 仍显示有效，超过 refreshInterval 未成功刷新也要纳入本轮，避免长期不刷导致调用时 401 */
+		staleByInterval := false
+		if lastMs := acc.lastRefreshMs.Load(); lastMs == 0 || (nowMs-lastMs) >= intervalMs {
+			staleByInterval = true
+		}
+
+		if tokenOK && !staleByInterval {
+			continue
 		}
 
 		result = append(result, acc)
@@ -1107,64 +1261,229 @@ func (m *Manager) forceRefreshAccount(ctx context.Context, acc *Account) bool {
 }
 
 /**
- * HandleAuth401 处理请求返回 401 的账号
- * 先将账号设为短暂冷却（立即从可用池中排除），然后后台异步刷新 Token
- * 刷新成功：恢复为 active 状态，账号重新可用
- * 刷新失败：从号池和磁盘中彻底删除该账号
- * 该方法是非阻塞的，不影响当前请求的响应速度
- * @param acc - 返回 401 的账号
+ * FindAccountByIdentifier 按邮箱或凭据文件路径（完整路径或仅文件名）查找号池中的账号
  */
-func (m *Manager) HandleAuth401(acc *Account) {
+func (m *Manager) FindAccountByIdentifier(email, filePath string) *Account {
+	email = strings.TrimSpace(email)
+	filePath = strings.TrimSpace(filePath)
+	if email == "" && filePath == "" {
+		return nil
+	}
+	accounts := m.GetAccounts()
+	wantBase := ""
+	if filePath != "" {
+		wantBase = filepath.Base(filePath)
+	}
+	wantEmail := strings.ToLower(email)
+	for _, a := range accounts {
+		if filePath != "" {
+			if a.FilePath == filePath || filepath.Base(a.FilePath) == wantBase {
+				return a
+			}
+		}
+		if email != "" && strings.ToLower(strings.TrimSpace(a.GetEmail())) == wantEmail {
+			return a
+		}
+	}
+	return nil
+}
+
+/**
+ * RecoverAuth401 对指定账号执行 401 恢复：同步刷新 → 若 429 则查额度（qc 非空）→ 仍失败则禁用凭据文件
+ * ctx 用于控制整体超时；刷新子过程另受 refresh-single-timeout 约束
+ */
+func (m *Manager) RecoverAuth401(ctx context.Context, acc *Account, qc *QuotaChecker) Auth401RecoverResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if acc == nil {
+		return Auth401RecoverResult{Status: Auth401RecoverInvalid, Detail: "account is nil"}
+	}
 	email := acc.GetEmail()
+	fp := acc.FilePath
+	out := Auth401RecoverResult{Email: email, FilePath: fp}
 
-	/* 立即设为冷却状态，防止后续请求继续使用该账号 */
-	acc.SetCooldown(time.Duration(m.cooldown401Sec) * time.Second)
-	log.Warnf("账号 [%s] 遇到 401，已临时冷却，后台刷新中...", email)
-
-	/* CAS 去重：防止同一账号被多个刷新源同时刷新 */
 	if !acc.refreshing.CompareAndSwap(0, 1) {
-		log.Debugf("账号 [%s] 已在刷新中，跳过 401 后台刷新", email)
-		return
+		out.Status = Auth401RecoverSkippedBusy
+		out.Detail = "账号正在刷新中，跳过"
+		log.Debugf("账号 [%s] 已在刷新中，跳过 401 恢复", email)
+		return out
+	}
+	defer acc.refreshing.Store(0)
+
+	refreshSec := m.refreshSingleTimeoutSec
+	if refreshSec < 1 {
+		refreshSec = defaultRefreshSingleTimeoutSec
+	}
+	rctx, rcancel := context.WithTimeout(ctx, time.Duration(refreshSec)*time.Second)
+	defer rcancel()
+
+	acc.mu.RLock()
+	refreshToken := acc.Token.RefreshToken
+	acc.mu.RUnlock()
+
+	if refreshToken == "" {
+		log.Warnf("账号 [%s] 无 refresh_token，禁用凭据", email)
+		m.DisableAccountByRenamingFile(acc, ReasonAuth401Disabled)
+		out.Status = Auth401RecoverDisabled
+		out.ReasonCode = ReasonAuth401Disabled
+		out.Detail = "missing refresh_token"
+		return out
 	}
 
-	/* 后台异步刷新 Token */
-	go func() {
-		defer acc.refreshing.Store(0)
-
-		timeoutSec := m.refreshSingleTimeoutSec
-		if timeoutSec < 1 {
-			timeoutSec = defaultRefreshSingleTimeoutSec
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
-		defer cancel()
-
-		acc.mu.RLock()
-		refreshToken := acc.Token.RefreshToken
-		acc.mu.RUnlock()
-
-		if refreshToken == "" {
-			log.Warnf("账号 [%s] 无 refresh_token，直接删除", email)
-			m.RemoveAccount(acc, ReasonAuth401)
-			return
-		}
-
-		td, err := m.refresher.RefreshTokenWithRetry(ctx, refreshToken, 2)
-		if err != nil {
-			/* 429 限频：设冷却而不是删除 */
-			if IsRateLimitRefreshErr(err) {
-				acc.SetCooldown(time.Duration(m.cooldown429Sec) * time.Second)
-				log.Warnf("账号 [%s] 401 后台刷新限频 429，冷却 %ds", email, m.cooldown429Sec)
-				return
-			}
-			log.Warnf("账号 [%s] 后台刷新失败，移除: %v", email, err)
-			m.RemoveAccount(acc, ReasonAuth401)
-			return
-		}
-
-		/* 刷新成功，更新 Token 并恢复为 active */
+	log.Warnf("账号 [%s] 401 恢复：正在同步刷新 Token...", email)
+	td, err := m.refresher.RefreshTokenWithRetry(rctx, refreshToken, 3)
+	if err == nil {
 		acc.UpdateToken(*td)
+		if err := m.saveTokenToFile(acc); err != nil {
+			log.Errorf("账号 [%s] 401 刷新成功但持久化失败: %v", td.Email, err)
+			out.Detail = "persist error: " + err.Error()
+		}
 		m.enqueueSave(acc)
-		log.Infof("账号 [%s] 后台刷新成功，已恢复可用", td.Email)
+		acc.SetActive()
+		m.InvalidateSelectorCache()
+		log.Infof("账号 [%s] 401 后刷新成功，已恢复可用", td.Email)
+		out.Status = Auth401RecoverRefreshed
+		return out
+	}
+
+	if IsRateLimitRefreshErr(err) {
+		if qc != nil && m.AccountInPool(acc) {
+			qctx, qcancel := context.WithTimeout(ctx, 25*time.Second)
+			r := qc.CheckAccountResult(qctx, acc)
+			qcancel()
+			if r == 1 {
+				acc.SetCooldown(time.Duration(m.cooldown429Sec) * time.Second)
+				m.InvalidateSelectorCache()
+				log.Warnf("账号 [%s] 401 刷新遇 429，额度仍有效，冷却 %ds", email, m.cooldown429Sec)
+				out.Status = Auth401RecoverCooldown429OK
+				out.Detail = "refresh 429, quota check passed"
+				return out
+			}
+			log.Warnf("账号 [%s] 401 刷新遇 429 且额度复核未通过(r=%d)，禁用凭据", email, r)
+			out.Detail = fmt.Sprintf("refresh 429, quota result=%d", r)
+		} else {
+			log.Warnf("账号 [%s] 401 刷新遇 429 且无额度查询或已出池，禁用凭据", email)
+			out.Detail = "refresh 429, no quota checker or not in pool"
+		}
+		m.DisableAccountByRenamingFile(acc, ReasonAuth401Disabled)
+		out.Status = Auth401RecoverDisabled
+		out.ReasonCode = ReasonAuth401Disabled
+		return out
+	}
+
+	log.Warnf("账号 [%s] 401 后刷新失败: %v，禁用凭据", email, err)
+	m.DisableAccountByRenamingFile(acc, ReasonAuth401Disabled)
+	out.Status = Auth401RecoverDisabled
+	out.ReasonCode = ReasonAuth401Disabled
+	out.Detail = err.Error()
+	return out
+}
+
+/**
+ * HandleAuth401 处理请求返回 401 的账号（委托 RecoverAuth401，使用独立超时上下文）
+ * @param acc - 返回 401 的账号
+ * @param qc - 额度查询器，可为 nil（此时刷新 429 视为无法复核，直接禁用）
+ */
+func (m *Manager) HandleAuth401(acc *Account, qc *QuotaChecker) {
+	if acc == nil {
+		return
+	}
+	timeoutSec := m.refreshSingleTimeoutSec
+	if timeoutSec < 1 {
+		timeoutSec = defaultRefreshSingleTimeoutSec
+	}
+	/* 刷新 + 额度查询预留余量 */
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec+35)*time.Second)
+	defer cancel()
+	_ = m.RecoverAuth401(ctx, acc, qc)
+}
+
+/**
+ * ScheduleUpstream429Recovery 上游 429 后异步：先查额度，未通过则等待 1 小时、刷新 token 再查，仍失败则删号
+ */
+func (m *Manager) ScheduleUpstream429Recovery(_ context.Context, acc *Account, qc *QuotaChecker) {
+	if qc == nil || acc == nil {
+		return
+	}
+	if !acc.upstream429Recovering.CompareAndSwap(0, 1) {
+		return
+	}
+	go func() {
+		defer acc.upstream429Recovering.Store(0)
+		email := acc.GetEmail()
+
+		qctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		r1 := qc.CheckAccountResult(qctx, acc)
+		cancel()
+		if r1 == 1 {
+			return
+		}
+
+		log.Warnf("账号 [%s] 上游 429 后额度查询未成功(r=%d)，1 小时后刷新凭证并重试", email, r1)
+
+		select {
+		case <-time.After(1 * time.Hour):
+		case <-m.stopCh:
+			return
+		}
+
+		if !m.AccountInPool(acc) {
+			return
+		}
+
+		if acc.refreshing.CompareAndSwap(0, 1) {
+			func() {
+				defer acc.refreshing.Store(0)
+				timeoutSec := m.refreshSingleTimeoutSec
+				if timeoutSec < 1 {
+					timeoutSec = defaultRefreshSingleTimeoutSec
+				}
+				rctx, rcancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
+				defer rcancel()
+				acc.mu.RLock()
+				rt := acc.Token.RefreshToken
+				acc.mu.RUnlock()
+				if rt == "" {
+					m.RemoveAccount(acc, ReasonQuotaRecheckFailed)
+					return
+				}
+				td, err := m.refresher.RefreshTokenWithRetry(rctx, rt, 3)
+				if err != nil {
+					if IsRateLimitRefreshErr(err) {
+						acc.SetCooldown(time.Duration(m.cooldown429Sec) * time.Second)
+						m.InvalidateSelectorCache()
+						return
+					}
+					m.RemoveAccount(acc, ReasonQuotaRecheckFailed)
+					return
+				}
+				acc.UpdateToken(*td)
+				if err := m.saveTokenToFile(acc); err != nil {
+					log.Errorf("账号 [%s] 429 恢复刷新后持久化失败: %v", acc.GetEmail(), err)
+				}
+				m.enqueueSave(acc)
+			}()
+		} else {
+			log.Debugf("账号 [%s] 429 恢复：跳过刷新（他处正在刷新）", email)
+		}
+
+		if !m.AccountInPool(acc) {
+			return
+		}
+
+		qctx2, cancel2 := context.WithTimeout(context.Background(), 25*time.Second)
+		r2 := qc.CheckAccountResult(qctx2, acc)
+		cancel2()
+		if r2 != 1 {
+			if m.AccountInPool(acc) {
+				m.RemoveAccount(acc, ReasonQuotaRecheckFailed)
+			}
+			return
+		}
+		acc.SetActive()
+		m.InvalidateSelectorCache()
+		log.Infof("账号 [%s] 429 恢复：额度查询已通过，已恢复可用", acc.GetEmail())
 	}()
 }
 

@@ -44,6 +44,7 @@ type Config struct {
 	LogLevel                 string   `yaml:"log-level"`
 	RefreshInterval          int      `yaml:"refresh-interval"`
 	MaxRetry                 int      `yaml:"max-retry"`
+	EnableHealthyRetry       bool     `yaml:"enable-healthy-retry"`
 	HealthCheckInterval      int      `yaml:"health-check-interval"`
 	HealthCheckMaxFailures   int      `yaml:"health-check-max-failures"`
 	HealthCheckConcurrency   int      `yaml:"health-check-concurrency"`
@@ -112,6 +113,7 @@ func LoadConfig(path string) (*Config, error) {
 		LogLevel:                   "info",
 		RefreshInterval:            3000,
 		MaxRetry:                   2,
+		EnableHealthyRetry:         true,
 		HealthCheckInterval:        300,
 		HealthCheckMaxFailures:     3,
 		HealthCheckConcurrency:     5,

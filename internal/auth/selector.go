@@ -13,8 +13,11 @@ import (
 	"time"
 )
 
-/* 可用账号缓存有效期（毫秒），超过此时间自动刷新 */
-const availableCacheTTLMs = 1000
+/* 可用账号缓存有效期（毫秒），超过此时间自动刷新（略短以减少选到已冷却/刚 401 的号） */
+const availableCacheTTLMs = 200
+
+/* 选号时距 access_token 过期不足该窗口则视为不可用（与后台刷新阈值一致） */
+const pickAvoidTokenExpireMarginMs = int64(5 * 60 * 1000)
 
 /**
  * Selector 定义账号选择器接口
@@ -53,6 +56,13 @@ type RoundRobinSelector struct {
  */
 func NewRoundRobinSelector() *RoundRobinSelector {
 	return &RoundRobinSelector{}
+}
+
+/**
+ * InvalidateAvailableCache 使可用账号缓存失效（账号状态变更时由 Manager 调用）
+ */
+func (s *RoundRobinSelector) InvalidateAvailableCache() {
+	s.cachePtr.Store(nil)
 }
 
 /**
@@ -223,6 +233,10 @@ func filterAvailable(accounts []*Account) []*Account {
 			if nowMs < acc.atomicCooldownMs.Load() {
 				continue
 			}
+		}
+		/* 即将过期的 access_token 不参与分配，避免周期性未刷新的号在调用时 401 */
+		if expMs := acc.accessExpireUnixMs.Load(); expMs > 0 && nowMs >= expMs-pickAvoidTokenExpireMarginMs {
+			continue
 		}
 		available = append(available, acc)
 	}

@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,10 +29,23 @@ import (
 
 /* 与 executor 一致的缓冲与扫描器大小，便于统一调优 */
 const (
-	wsBufferSize    = 32 * 1024
-	scannerInitSize = 4 * 1024
-	scannerMaxSize  = 50 * 1024 * 1024
+	wsBufferSize     = 32 * 1024
+	scannerInitSize  = 4 * 1024
+	scannerMaxSize   = 50 * 1024 * 1024
+	statsMaxPageSize = 200
 )
+
+type statsPagination struct {
+	Page          int    `json:"page"`
+	PageSize      int    `json:"page_size"`
+	Total         int    `json:"total"`
+	FilteredTotal int    `json:"filtered_total"`
+	TotalPages    int    `json:"total_pages"`
+	Returned      int    `json:"returned"`
+	HasPrev       bool   `json:"has_prev"`
+	HasNext       bool   `json:"has_next"`
+	Query         string `json:"query,omitempty"`
+}
 
 var responsesWSUpgrader = websocket.FastHTTPUpgrader{
 	ReadBufferSize:  wsBufferSize,
@@ -53,6 +67,7 @@ type ProxyHandler struct {
 	executor              *executor.Executor
 	apiKeys               []string
 	maxRetry              int
+	enableHealthyRetry    bool
 	quotaChecker          *auth.QuotaChecker
 	indexHTML             []byte
 	upstreamTimeoutSec    int
@@ -70,7 +85,7 @@ type ProxyHandler struct {
  * @param quotaCheckConcurrency - 额度查询并发数（来自 config）
  * @returns *ProxyHandler - 代理处理器实例
  */
-func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []string, maxRetry int, proxyURL string, baseURL string, enableHTTP2 bool, backendDomain string, backendResolveAddress string, quotaCheckConcurrency int, upstreamTimeoutSec, emptyRetryMax, streamIdleTimeoutSec int, enableStreamIdleRetry bool, indexHTML []byte) *ProxyHandler {
+func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []string, maxRetry int, enableHealthyRetry bool, proxyURL string, baseURL string, enableHTTP2 bool, backendDomain string, backendResolveAddress string, quotaCheckConcurrency int, upstreamTimeoutSec, emptyRetryMax, streamIdleTimeoutSec int, enableStreamIdleRetry bool, indexHTML []byte) *ProxyHandler {
 	if maxRetry < 0 {
 		maxRetry = 0
 	}
@@ -82,6 +97,7 @@ func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []s
 		executor:              exec,
 		apiKeys:               apiKeys,
 		maxRetry:              maxRetry,
+		enableHealthyRetry:    enableHealthyRetry,
 		quotaChecker:          auth.NewQuotaChecker(baseURL, proxyURL, quotaCheckConcurrency, enableHTTP2, backendDomain, backendResolveAddress),
 		indexHTML:             indexHTML,
 		upstreamTimeoutSec:    upstreamTimeoutSec,
@@ -132,14 +148,17 @@ func (h *ProxyHandler) RegisterRoutes(r *fasthttprouter.Router) {
 	statsHandler := h.handleStats
 	refreshHandler := h.handleRefresh
 	checkQuotaHandler := h.handleCheckQuota
+	recoverAuthHandler := h.handleRecoverAuth
 	if len(h.apiKeys) > 0 {
 		statsHandler = h.authMiddleware(h.handleStats)
 		refreshHandler = h.authMiddleware(h.handleRefresh)
 		checkQuotaHandler = h.authMiddleware(h.handleCheckQuota)
+		recoverAuthHandler = h.authMiddleware(h.handleRecoverAuth)
 	}
 	r.GET("/stats", statsHandler)
 	r.POST("/refresh", refreshHandler)
 	r.POST("/check-quota", checkQuotaHandler)
+	r.POST("/recover-auth", recoverAuthHandler)
 }
 
 /**
@@ -259,17 +278,40 @@ func (h *ProxyHandler) handleModels(ctx *fasthttp.RequestCtx) {
  * @returns executor.RetryConfig - 重试配置
  */
 func (h *ProxyHandler) buildRetryConfig() executor.RetryConfig {
-	return executor.RetryConfig{
+	healthyPick := func(model string, excluded map[string]bool) (*auth.Account, error) {
+		return h.manager.PickRecentlySuccessful(model, excluded)
+	}
+	rc := executor.RetryConfig{
 		PickFn: func(model string, excluded map[string]bool) (*auth.Account, error) {
 			return h.manager.PickExcluding(model, excluded)
 		},
-		On401Fn:               func(acc *auth.Account) { h.manager.HandleAuth401(acc) },
+		On401Fn: func(acc *auth.Account) { h.manager.HandleAuth401(acc, h.quotaChecker) },
+		On429RecoveryFn: func(ctx context.Context, acc *auth.Account) {
+			h.manager.ScheduleUpstream429Recovery(ctx, acc, h.quotaChecker)
+		},
+		OnAfterUpstreamErrFn: func(acc *auth.Account, statusCode int) {
+			if statusCode >= 200 && statusCode < 300 {
+				return
+			}
+			h.manager.InvalidateSelectorCache()
+		},
 		MaxRetry:              h.maxRetry,
 		UpstreamTimeoutSec:    h.upstreamTimeoutSec,
 		EmptyRetryMax:         h.emptyRetryMax,
 		StreamIdleTimeoutSec:  h.streamIdleTimeoutSec,
 		EnableStreamIdleRetry: h.enableStreamIdleRetry,
 	}
+	if h.enableHealthyRetry {
+		rc.HealthyPickFn = healthyPick
+		if h.maxRetry >= 2 {
+			/* 前 max-retry-1 次用常规换号，之后用最近成功账号，减少无效轮询 */
+			rc.HealthyPickMinAttempt = h.maxRetry - 1
+		} else {
+			/* max-retry 为 0/1 时无「切换窗口」，仅在全部常规尝试失败后回退一次 */
+			rc.FallbackRecentPickFn = healthyPick
+		}
+	}
+	return rc
 }
 
 /**
@@ -355,11 +397,7 @@ func (h *ProxyHandler) handleChatCompletions(ctx *fasthttp.RequestCtx) {
 	rc := h.buildRetryConfig()
 
 	if stream {
-		ctx.Response.Header.Set("Content-Type", "text/event-stream")
-		ctx.Response.Header.Set("Cache-Control", "no-cache")
-		ctx.Response.Header.Set("Connection", "keep-alive")
-		ctx.SetStatusCode(fasthttp.StatusOK)
-
+		/* 须等 sendWithRetry 成功后再写 200 与 SSE 头（由 executor 经 ResponseWriter 写入），否则失败后无法向客户端返回真实上游状态码 */
 		ctx.SetBodyStreamWriter(func(w *bufio.Writer) {
 			writer := newFastHTTPResponseWriter(ctx, w)
 			execErr := h.executor.ExecuteStream(ctx, rc, body, model, writer)
@@ -388,14 +426,55 @@ func (h *ProxyHandler) handleChatCompletions(ctx *fasthttp.RequestCtx) {
  * 返回所有账号的状态、请求数、错误数等统计信息
  */
 func (h *ProxyHandler) handleStats(ctx *fasthttp.RequestCtx) {
+	args := ctx.QueryArgs()
+	pageMode := len(args.Peek("page")) > 0 || len(args.Peek("page_size")) > 0 || len(args.Peek("q")) > 0 || len(args.Peek("include_quota")) > 0
+	query := strings.ToLower(strings.TrimSpace(string(args.Peek("q"))))
+	includeQuota := queryBoolArg(args, "include_quota")
 	accounts := h.manager.GetAccounts()
-	stats := make([]auth.AccountStats, 0, len(accounts))
 	active, cooldown, disabled := 0, 0, 0
 	var totalInputTokens, totalOutputTokens int64
 
+	if !pageMode {
+		stats := make([]auth.AccountStats, 0, len(accounts))
+		for _, acc := range accounts {
+			s := acc.GetStats()
+			stats = append(stats, s)
+			totalInputTokens += s.Usage.InputTokens
+			totalOutputTokens += s.Usage.OutputTokens
+			switch s.Status {
+			case "active":
+				active++
+			case "cooldown":
+				cooldown++
+			case "disabled":
+				disabled++
+			}
+		}
+
+		writeJSON(ctx, fasthttp.StatusOK, map[string]any{
+			"summary": map[string]any{
+				"total":               len(accounts),
+				"active":              active,
+				"cooldown":            cooldown,
+				"disabled":            disabled,
+				"rpm":                 GetRPM(),
+				"total_input_tokens":  totalInputTokens,
+				"total_output_tokens": totalOutputTokens,
+			},
+			"accounts": stats,
+		})
+		return
+	}
+
+	page := parsePositiveIntArg(args, "page", 1, 0)
+	pageSize := parsePositiveIntArg(args, "page_size", 100, statsMaxPageSize)
+	pageStart := (page - 1) * pageSize
+	pageEnd := pageStart + pageSize
+	stats := make([]auth.AccountStats, 0, pageSize)
+	filteredTotal := 0
+
 	for _, acc := range accounts {
 		s := acc.GetStats()
-		stats = append(stats, s)
 		totalInputTokens += s.Usage.InputTokens
 		totalOutputTokens += s.Usage.OutputTokens
 		switch s.Status {
@@ -406,6 +485,25 @@ func (h *ProxyHandler) handleStats(ctx *fasthttp.RequestCtx) {
 		case "disabled":
 			disabled++
 		}
+
+		if query != "" && !strings.Contains(strings.ToLower(s.Email), query) {
+			continue
+		}
+
+		idx := filteredTotal
+		filteredTotal++
+		if idx < pageStart || idx >= pageEnd {
+			continue
+		}
+		if !includeQuota {
+			s.Quota = nil
+		}
+		stats = append(stats, s)
+	}
+
+	totalPages := 1
+	if filteredTotal > 0 {
+		totalPages = (filteredTotal + pageSize - 1) / pageSize
 	}
 
 	writeJSON(ctx, fasthttp.StatusOK, map[string]any{
@@ -419,6 +517,104 @@ func (h *ProxyHandler) handleStats(ctx *fasthttp.RequestCtx) {
 			"total_output_tokens": totalOutputTokens,
 		},
 		"accounts": stats,
+		"pagination": statsPagination{
+			Page:          page,
+			PageSize:      pageSize,
+			Total:         len(accounts),
+			FilteredTotal: filteredTotal,
+			TotalPages:    totalPages,
+			Returned:      len(stats),
+			HasPrev:       page > 1 && filteredTotal > 0,
+			HasNext:       page < totalPages,
+			Query:         query,
+		},
+	})
+}
+
+func parsePositiveIntArg(args *fasthttp.Args, key string, defaultValue, maxValue int) int {
+	raw := strings.TrimSpace(string(args.Peek(key)))
+	if raw == "" {
+		return defaultValue
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value <= 0 {
+		return defaultValue
+	}
+	if maxValue > 0 && value > maxValue {
+		return maxValue
+	}
+	return value
+}
+
+func queryBoolArg(args *fasthttp.Args, key string) bool {
+	switch strings.ToLower(strings.TrimSpace(string(args.Peek(key)))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+/**
+ * handleRecoverAuth POST /recover-auth
+ * 对指定账号或全部账号执行与上游 401 相同的恢复流程：同步刷新 token；遇 429 则查额度；仍失败则禁用凭据（JSON 重命名为 *.disabled）
+ * 请求体 JSON：{ "email":"..." } 或 { "file_path":"..." } 指定其一；{ "all": true } 遍历当前号池全部账号（顺序执行，账号多时会较慢）
+ */
+func (h *ProxyHandler) handleRecoverAuth(ctx *fasthttp.RequestCtx) {
+	start := time.Now()
+	body := ctx.PostBody()
+	if len(body) == 0 {
+		writeJSON(ctx, fasthttp.StatusBadRequest, map[string]any{
+			"error": map[string]any{"message": "请求体不能为空", "type": "invalid_request_error"},
+		})
+		return
+	}
+	var req struct {
+		Email    string `json:"email"`
+		FilePath string `json:"file_path"`
+		All      bool   `json:"all"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeJSON(ctx, fasthttp.StatusBadRequest, map[string]any{
+			"error": map[string]any{"message": "JSON 解析失败", "type": "invalid_request_error"},
+		})
+		return
+	}
+
+	baseCtx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
+	defer cancel()
+
+	if req.All {
+		list := h.manager.GetAccounts()
+		results := make([]auth.Auth401RecoverResult, 0, len(list))
+		for _, acc := range list {
+			results = append(results, h.manager.RecoverAuth401(baseCtx, acc, h.quotaChecker))
+		}
+		writeJSON(ctx, fasthttp.StatusOK, map[string]any{
+			"object":      "list",
+			"results":     results,
+			"count":       len(results),
+			"duration_ms": time.Since(start).Milliseconds(),
+		})
+		return
+	}
+
+	acc := h.manager.FindAccountByIdentifier(req.Email, req.FilePath)
+	if acc == nil {
+		writeJSON(ctx, fasthttp.StatusNotFound, map[string]any{
+			"error": map[string]any{
+				"message": "未找到账号，请提供 email 或 file_path，或设置 all 为 true",
+				"type":    "invalid_request_error",
+			},
+		})
+		return
+	}
+
+	r := h.manager.RecoverAuth401(baseCtx, acc, h.quotaChecker)
+	writeJSON(ctx, fasthttp.StatusOK, map[string]any{
+		"object":      "auth401_recover_result",
+		"result":      r,
+		"duration_ms": time.Since(start).Milliseconds(),
 	})
 }
 
@@ -453,6 +649,7 @@ func writeSSEProgress(ctx *fasthttp.RequestCtx, ch <-chan auth.ProgressEvent) {
 	ctx.Response.Header.Set("Connection", "keep-alive")
 	ctx.SetStatusCode(fasthttp.StatusOK)
 
+	/* fasthttp：StreamWriter 内禁止访问 RequestCtx（见 SetBodyStreamWriter 文档） */
 	ctx.SetBodyStreamWriter(func(w *bufio.Writer) {
 		for event := range ch {
 			data, err := json.Marshal(event)
@@ -461,9 +658,6 @@ func writeSSEProgress(ctx *fasthttp.RequestCtx, ch <-chan auth.ProgressEvent) {
 			}
 			_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event.Type, data)
 			_ = w.Flush()
-			if ctx.Err() != nil {
-				return
-			}
 		}
 	})
 }
@@ -497,11 +691,6 @@ func (h *ProxyHandler) handleResponses(ctx *fasthttp.RequestCtx) {
 	rc := h.buildRetryConfig()
 
 	if stream {
-		ctx.Response.Header.Set("Content-Type", "text/event-stream")
-		ctx.Response.Header.Set("Cache-Control", "no-cache")
-		ctx.Response.Header.Set("Connection", "keep-alive")
-		ctx.SetStatusCode(fasthttp.StatusOK)
-
 		ctx.SetBodyStreamWriter(func(w *bufio.Writer) {
 			writer := newFastHTTPResponseWriter(ctx, w)
 			execErr := h.executor.ExecuteResponsesStream(ctx, rc, body, model, writer)
@@ -595,16 +784,7 @@ func (h *ProxyHandler) forwardResponsesSSEAsWS(ctx context.Context, conn *websoc
 	excludedForEmpty := make(map[string]bool)
 
 	for emptyAttempt := 0; emptyAttempt <= emptyRetryMax; emptyAttempt++ {
-		rcExcl := rc
-		if len(excludedForEmpty) > 0 {
-			origPick := rc.PickFn
-			rcExcl.PickFn = func(m string, excl map[string]bool) (*auth.Account, error) {
-				for k := range excludedForEmpty {
-					excl[k] = true
-				}
-				return origPick(m, excl)
-			}
-		}
+		rcExcl := executor.MergeRetryConfigExcluded(rc, excludedForEmpty)
 
 		rawResp, account, attempts, baseModel, convertDur, sendDur, err := h.executor.OpenResponsesStream(ctx, rcExcl, requestBody, model)
 		if err != nil {
@@ -734,11 +914,6 @@ func (h *ProxyHandler) handleResponsesCompact(ctx *fasthttp.RequestCtx) {
 	rc := h.buildRetryConfig()
 
 	if stream {
-		ctx.Response.Header.Set("Content-Type", "text/event-stream")
-		ctx.Response.Header.Set("Cache-Control", "no-cache")
-		ctx.Response.Header.Set("Connection", "keep-alive")
-		ctx.SetStatusCode(fasthttp.StatusOK)
-
 		ctx.SetBodyStreamWriter(func(w *bufio.Writer) {
 			writer := newFastHTTPResponseWriter(ctx, w)
 			execErr := h.executor.ExecuteResponsesCompactStream(ctx, rc, body, model, writer)

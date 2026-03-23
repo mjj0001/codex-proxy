@@ -44,7 +44,12 @@ log-level: "info"
 refresh-interval: 3000
 
 # 请求失败最大重试次数（切换账号重试，0 表示不重试）
+# 总尝试次数 = max-retry + 1。启用 enable-healthy-retry 且 max-retry>=2 时：
+# 前 (max-retry-1) 次用常规轮询换号，从第 max-retry 次起改用「最近调用成功」的账号，减少无效切换耗时。
 max-retry: 2
+
+# 是否在换号重试中使用「最近成功账号」策略（false 则全程常规选号，且无末尾回退）
+enable-healthy-retry: true
 
 # 健康检查间隔（秒），0 表示禁用健康检查
 health-check-interval: 300
@@ -121,6 +126,13 @@ max-idle-conns-per-host: 512
 # 是否启用 HTTP/2（默认 false，避免长 SSE 连接造成队头阻塞）
 enable-http2: false
 
+# 管理类 HTTP 接口（若配置了 api-keys 则需带相同 Key）:
+#   POST /recover-auth  — 401 恢复：同步刷新 token；刷新 429 时查额度；仍失败则凭据重命名为 *.json.disabled
+#     请求体: {"email":"a@b.com"} 或 {"file_path":"账号.json"} 或 {"all":true}
+#   POST /refresh        — SSE 流式强制刷新全部账号
+#   POST /check-quota    — SSE 流式查询额度
+#   GET  /stats          — 账号统计
+#
 # API Key 鉴权（可选，为空则不鉴权）
 # api-keys:
 #   - "sk-your-custom-key-1"
