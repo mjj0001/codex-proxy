@@ -979,6 +979,14 @@ func (m *Manager) Pick(model string) (*Account, error) {
  * @returns *Account - 选中的账号
  * @returns error - 没有可用账号时返回错误
  */
+/**
+ * PickExcluding 选择下一个可用账号，排除已用过的账号，优先选择活跃的账号
+ * 策略：先排除失败账号 → 再过滤活跃状态 → 最后调用选择器
+ * @param model - 请求的模型名称
+ * @param excluded - 已排除的账号文件路径集合
+ * @returns *Account - 选中的账号
+ * @returns error - 没有可用账号时返回错误
+ */
 func (m *Manager) PickExcluding(model string, excluded map[string]bool) (*Account, error) {
 	/* 原子指针读取，零锁 */
 	allAccounts := *m.accountsPtr.Load()
@@ -986,6 +994,7 @@ func (m *Manager) PickExcluding(model string, excluded map[string]bool) (*Accoun
 		return m.selector.Pick(model, allAccounts)
 	}
 
+	/* 第一层过滤：排除掉已失败的账号 */
 	capFiltered := len(allAccounts) - len(excluded)
 	if capFiltered < 0 {
 		capFiltered = 0
@@ -1001,12 +1010,38 @@ func (m *Manager) PickExcluding(model string, excluded map[string]bool) (*Accoun
 		return nil, fmt.Errorf("没有更多可用账号（已排除 %d 个）", len(excluded))
 	}
 
+	/* 第二层过滤：优先选择活跃的账号（非冷却非禁用）*/
+	nowMs := time.Now().UnixMilli()
+	activeOnly := make([]*Account, 0, len(filtered))
+	for _, acc := range filtered {
+		status := AccountStatus(acc.atomicStatus.Load())
+		/* 跳过禁用和冷却中的账号 */
+		if status == StatusDisabled {
+			continue
+		}
+		if status == StatusCooldown {
+			if nowMs < acc.atomicCooldownMs.Load() {
+				continue
+			}
+		}
+		activeOnly = append(activeOnly, acc)
+	}
+
+	/* 如果有活跃账号，优先用活跃账号；否则用过滤后的列表（可能包含冷却的） */
+	if len(activeOnly) > 0 {
+		return m.selector.Pick(model, activeOnly)
+	}
+
+	/* 没有活跃账号了，退而求其次用原始过滤列表 */
 	return m.selector.Pick(model, filtered)
 }
 
 /**
  * PickRecentlySuccessful 在换号重试仍失败时作为回退：选取最近一次成功完成请求的账号（LastUsedAt 最新）。
  * 优先选择本轮尚未尝试过的账号；若均已尝试则仍取全局最近成功者。
+ */
+/**
+ * PickRecentlySuccessful 回退选择：优先选最近成功且非排除的账号；所有都排除时清空排除列表重选正常账号
  */
 func (m *Manager) PickRecentlySuccessful(model string, excluded map[string]bool) (*Account, error) {
 	_ = model
@@ -1030,20 +1065,39 @@ func (m *Manager) PickRecentlySuccessful(model string, excluded map[string]bool)
 		}
 		list = append(list, cand{acc: acc, t: t})
 	}
+
 	if len(list) == 0 {
-		return nil, fmt.Errorf("没有可用于回退的最近成功账号")
+		/* 没有近期成功的账号，选任何可用的正常账号 */
+		for _, acc := range allAccounts {
+			st := AccountStatus(acc.atomicStatus.Load())
+			if st == StatusDisabled || st == StatusCooldown {
+				continue
+			}
+			if acc.quotaProbeInFlight.Load() > 0 {
+				continue
+			}
+			/* 找到任何正常账号就用 */
+			return acc, nil
+		}
+		return nil, fmt.Errorf("没有可用账号")
 	}
+
 	sort.Slice(list, func(i, j int) bool {
 		if !list[i].t.Equal(list[j].t) {
 			return list[i].t.After(list[j].t)
 		}
 		return list[i].acc.FilePath < list[j].acc.FilePath
 	})
+
+	/* 优先选未被排除的最近成功账号 */
 	for _, c := range list {
 		if excluded == nil || !excluded[c.acc.FilePath] {
 			return c.acc, nil
 		}
 	}
+
+	/* 所有最近成功的都被排除了，清空排除集合重选一个正常账号 */
+	/* 这样可以打破"所有号都失败"的死局，使用最近成功的账号再试一次*/
 	return list[0].acc, nil
 }
 
@@ -1930,6 +1984,9 @@ func (m *Manager) ForceRefreshAllStream(ctx context.Context, quotaChecker *Quota
 
 		for _, acc := range accounts {
 			acc.SetActive()
+			if m.db != nil {
+				m.enqueueSave(acc)
+			}
 		}
 
 		sem := make(chan struct{}, m.refreshConcurrency)
@@ -2187,6 +2244,9 @@ func (m *Manager) recoverAuth401Once(ctx context.Context, acc *Account, qc *Quot
 		}
 		m.enqueueSave(acc)
 		acc.SetActive()
+		if m.db != nil {
+			m.enqueueSave(acc)
+		}
 		m.InvalidateSelectorCache()
 		log.Infof("账号 [%s] 401 后刷新成功，已恢复可用", acc.GetEmail())
 		out.Status = Auth401RecoverRefreshed
@@ -2201,6 +2261,9 @@ func (m *Manager) recoverAuth401Once(ctx context.Context, acc *Account, qc *Quot
 			out.ReasonCode = ReasonQuotaInvalidAfterRefresh
 			out.Detail = "刷新恢复后额度接口判无效，已删号"
 			m.InvalidateSelectorCache()
+			if m.db != nil {
+				m.enqueueSave(acc)
+			}
 			return out
 		}
 		acc.SetActive()
@@ -2212,7 +2275,9 @@ func (m *Manager) recoverAuth401Once(ctx context.Context, acc *Account, qc *Quot
 }
 
 /**
- * HandleAuth401 处理请求返回 401 的账号（委托 RecoverAuth401）
+ * HandleAuth401 处理请求返回 401 的账号
+ * 采用同步刷新策略：阻塞当前请求，同步刷新 Token，直到成功/失败/超时
+ * 然后返回刷新结果：成功则重试当前账号，失败则需切换账号
  * @param acc - 返回 401 的账号
  * @param qc - 额度查询器，可为 nil（此时刷新 429 视为无法复核，直接禁用）
  */
@@ -2220,12 +2285,15 @@ func (m *Manager) HandleAuth401(acc *Account, qc *QuotaChecker) Auth401RecoverRe
 	if acc == nil {
 		return Auth401RecoverResult{Status: Auth401RecoverInvalid, Detail: "account is nil"}
 	}
+
 	timeoutSec := m.refreshSingleTimeoutSec
 	if timeoutSec < 1 {
 		timeoutSec = defaultRefreshSingleTimeoutSec
 	}
 	hctx, hcancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec+35)*time.Second)
 	defer hcancel()
+
+	/* 同步等待 Token 刷新完成，获取最新状态 */
 	return m.RecoverAuth401(hctx, acc, qc)
 }
 
@@ -2305,6 +2373,9 @@ func (m *Manager) ScheduleUpstream429Recovery(_ context.Context, acc *Account, q
 		cancel2()
 		if v2 == 1 {
 			acc.SetActive()
+			if m.db != nil {
+				m.enqueueSave(acc)
+			}
 			m.InvalidateSelectorCache()
 			log.Infof("账号 [%s] 429 恢复：额度查询已通过，已恢复可用", acc.GetEmail())
 			return
