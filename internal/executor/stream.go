@@ -14,6 +14,7 @@ import (
 	"codex-proxy/internal/translator"
 
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -26,6 +27,8 @@ type CodexResponsesStream struct {
 	ConvertDur   time.Duration
 	SendDur      time.Duration
 	reverseTools map[string]string
+	/* IncludeUsage 为 true 时按 OpenAI stream_options.include_usage 在 [DONE] 前追加 choices 为 [] 的 usage 块 */
+	IncludeUsage bool
 }
 
 /* prefixThenRestCloser 首读已拉取的字节 + 剩余 Body，供在返回给客户端前探测 GOAWAY 后仍能透传已读数据 */
@@ -56,13 +59,14 @@ func (p *prefixThenRestCloser) Close() error {
 	return err
 }
 
-// OpenCodexResponsesStream 完成选号、重试与首包前的 HTTP 往返；调用方在写入客户端 SSE 头后再 Pump。
-// 在返回前做一次首读：若立即遇 GOAWAY 等可重试错误则关连接换号重来，减少「已 200 后 pump 才断」的失败率。
-func (e *Executor) OpenCodexResponsesStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string) (*CodexResponsesStream, error) {
+// openCodexResponsesBody 与 OpenCodexResponsesStream 相同：选号、sendWithRetry、首读探测空体/可重试读错并换号。
+// Claude 原始流等非 Pump 路径也经此打开，避免 200 + 空 body 导致客户端 SSE 体完全无字节。
+func (e *Executor) openCodexResponsesBody(ctx context.Context, rc RetryConfig, requestBody []byte, model string) (bodyRC io.ReadCloser, account *auth.Account, attempts int, baseModel string, convertDur, sendDur time.Duration, reverseTools map[string]string, err error) {
 	convertStart := time.Now()
-	body, baseModel := thinking.ApplyThinking(requestBody, model)
-	codexBody := translator.ConvertOpenAIRequestToCodex(baseModel, body, true)
-	convertDur := time.Since(convertStart)
+	thBody, bm := thinking.ApplyThinking(requestBody, model)
+	baseModel = bm
+	codexBody := translator.ConvertOpenAIRequestToCodex(baseModel, thBody, true)
+	convertDur = time.Since(convertStart)
 	apiURL := e.baseURL + "/responses"
 	sendStart := time.Now()
 
@@ -77,54 +81,67 @@ func (e *Executor) OpenCodexResponsesStream(ctx context.Context, rc RetryConfig,
 
 	for round := 0; round < readRounds; round++ {
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return nil, nil, 0, baseModel, convertDur, time.Since(sendStart), nil, ctx.Err()
 		}
 		rcExcl := MergeRetryConfigExcluded(rc, excluded)
-		httpResp, account, attempts, err := e.sendWithRetry(ctx, rcExcl, model, apiURL, codexBody, true)
-		if err != nil {
-			return nil, err
+		httpResp, acc, att, serr := e.sendWithRetry(ctx, rcExcl, model, apiURL, codexBody, true)
+		if serr != nil {
+			return nil, nil, 0, baseModel, convertDur, time.Since(sendStart), nil, serr
 		}
 
 		buf := make([]byte, 32768)
 		n, rerr := httpResp.Body.Read(buf)
 		if rerr != nil && rerr != io.EOF {
 			_ = httpResp.Body.Close()
-			account.RecordFailure()
+			acc.RecordFailure()
 			if isRetryableUpstreamReadErr(rerr) && round+1 < readRounds {
-				excluded[account.FilePath] = true
-				log.Warnf("responses-stream 首读失败，换号/重建连接重试 (%d/%d) account=%s: %v", round+1, readRounds, account.GetEmail(), wrapReadErr(rerr))
+				excluded[acc.FilePath] = true
+				log.Warnf("responses-stream 首读失败，换号/重建连接重试 (%d/%d) account=%s: %v", round+1, readRounds, acc.GetEmail(), wrapReadErr(rerr))
 				continue
 			}
-			return nil, fmt.Errorf("读取上游流失败: %w", wrapReadErr(rerr))
+			return nil, nil, 0, baseModel, convertDur, time.Since(sendStart), nil, fmt.Errorf("读取上游流失败: %w", wrapReadErr(rerr))
 		}
 
-		sendDur := time.Since(sendStart)
-		var bodyRC io.ReadCloser = httpResp.Body
+		sendDur = time.Since(sendStart)
+		var br io.ReadCloser = httpResp.Body
 		if n > 0 {
 			prefix := append([]byte(nil), buf[:n]...)
-			bodyRC = &prefixThenRestCloser{prefix: prefix, rest: httpResp.Body}
+			br = &prefixThenRestCloser{prefix: prefix, rest: httpResp.Body}
 		} else if rerr == io.EOF {
 			_ = httpResp.Body.Close()
-			account.RecordFailure()
+			acc.RecordFailure()
 			if round+1 < readRounds {
-				excluded[account.FilePath] = true
-				log.Warnf("responses-stream 上游立即 EOF，换号重试 (%d/%d) account=%s", round+1, readRounds, account.GetEmail())
+				excluded[acc.FilePath] = true
+				log.Warnf("responses-stream 上游立即 EOF，换号重试 (%d/%d) account=%s", round+1, readRounds, acc.GetEmail())
 				continue
 			}
-			return nil, fmt.Errorf("读取上游流失败: 空响应")
+			return nil, nil, 0, baseModel, convertDur, sendDur, nil, fmt.Errorf("读取上游流失败: 空响应")
 		}
 
-		return &CodexResponsesStream{
-			body:         bodyRC,
-			account:      account,
-			Attempts:     attempts,
-			BaseModel:    baseModel,
-			ConvertDur:   convertDur,
-			SendDur:      sendDur,
-			reverseTools: translator.BuildReverseToolNameMap(requestBody),
-		}, nil
+		rt := translator.BuildReverseToolNameMap(requestBody)
+		return br, acc, att, baseModel, convertDur, sendDur, rt, nil
 	}
-	return nil, fmt.Errorf("读取上游流失败")
+	return nil, nil, 0, baseModel, convertDur, time.Since(sendStart), nil, fmt.Errorf("读取上游流失败")
+}
+
+// OpenCodexResponsesStream 完成选号、重试与首包前的 HTTP 往返；调用方在写入客户端 SSE 头后再 Pump。
+// 在返回前做一次首读：若立即遇 GOAWAY 等可重试错误则关连接换号重来，减少「已 200 后 pump 才断」的失败率。
+func (e *Executor) OpenCodexResponsesStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string) (*CodexResponsesStream, error) {
+	bodyRC, account, attempts, baseModel, convertDur, sendDur, reverseTools, err := e.openCodexResponsesBody(ctx, rc, requestBody, model)
+	if err != nil {
+		return nil, err
+	}
+	includeUsage := gjson.GetBytes(requestBody, "stream_options.include_usage").Bool()
+	return &CodexResponsesStream{
+		body:         bodyRC,
+		account:      account,
+		Attempts:     attempts,
+		BaseModel:    baseModel,
+		ConvertDur:   convertDur,
+		SendDur:      sendDur,
+		reverseTools: reverseTools,
+		IncludeUsage: includeUsage,
+	}, nil
 }
 
 // PumpChatCompletion 将 Codex SSE 转为 OpenAI Chat Completions 块写入 w（客户端 SSE 头须已由 handler 写好）。
@@ -143,7 +160,7 @@ func (s *CodexResponsesStream) PumpChatCompletion(w io.Writer, flush func()) err
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
-		chunks := translator.ConvertStreamChunk(pumpCtx, line, state, reverseToolMap)
+		chunks := translator.ConvertStreamChunk(pumpCtx, line, state, reverseToolMap, s.IncludeUsage)
 		for _, chunk := range chunks {
 			if firstChunkAt.IsZero() {
 				firstChunkAt = time.Now()
@@ -171,6 +188,10 @@ func (s *CodexResponsesStream) PumpChatCompletion(w io.Writer, flush func()) err
 				firstChunkDur = firstChunkAt.Sub(streamStart)
 			}
 			log.Infof("req summary stream model=%s account=%s attempts=%d convert=%v upstream_ttfb=%v first_chunk=%v to_completed=%v tail_after_completed=%v stream=%v chunks=%d total=%v (canceled)", s.BaseModel, s.account.GetEmail(), s.Attempts, s.ConvertDur, s.SendDur, firstChunkDur, time.Duration(0), time.Duration(0), time.Since(streamStart), chunkCount, time.Since(streamStart))
+			/* 已向客户端承诺 SSE：无任何 data 时须返回错误，避免 200 + 空体 */
+			if chunkCount == 0 {
+				return fmt.Errorf("读取流式响应中断: %w", err)
+			}
 			return nil
 		}
 		log.Errorf("读取流式响应失败: %v", err)
@@ -187,7 +208,8 @@ func (s *CodexResponsesStream) PumpChatCompletion(w io.Writer, flush func()) err
 		log.Infof("req summary stream model=%s account=%s attempts=%d convert=%v upstream_ttfb=%v first_chunk=%v to_completed=%v tail_after_completed=%v stream=%v chunks=%d total=%v (ERR)", s.BaseModel, s.account.GetEmail(), s.Attempts, s.ConvertDur, s.SendDur, firstChunkDur, completedDur, tailAfterCompleted, time.Since(streamStart), chunkCount, time.Since(streamStart))
 		return wrapReadErr(err)
 	}
-	if !state.HasText && !state.HasToolCall && !state.HasReasoning {
+	/* response.completed 会写出带 finish_reason 的 chunk，但未必有正文；仍视为有效流并须写 [DONE] */
+	if !state.HasText && !state.HasToolCall && !state.HasReasoning && !state.Completed {
 		firstChunkDur := time.Duration(0)
 		completedDur := time.Duration(0)
 		tailAfterCompleted := time.Duration(0)
@@ -215,6 +237,17 @@ func (s *CodexResponsesStream) PumpChatCompletion(w io.Writer, flush func()) err
 		chunkCount++
 		_, _ = w.Write(sseDataPrefix)
 		_, _ = io.WriteString(w, synth)
+		_, _ = w.Write(sseDataSuffix)
+		if flush != nil {
+			flush()
+		}
+	}
+
+	if s.IncludeUsage {
+		usageChunk := translator.BuildChatCompletionStreamUsageOnlyChunk(state)
+		chunkCount++
+		_, _ = w.Write(sseDataPrefix)
+		_, _ = io.WriteString(w, usageChunk)
 		_, _ = w.Write(sseDataSuffix)
 		if flush != nil {
 			flush()

@@ -882,16 +882,11 @@ type RawResponse struct {
  * @returns error - 请求发送失败时返回错误
  */
 func (e *Executor) ExecuteRawCodexStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string) (*RawResponse, *auth.Account, error) {
-	body, baseModel := thinking.ApplyThinking(requestBody, model)
-	codexBody := translator.ConvertOpenAIRequestToCodex(baseModel, body, true)
-	apiURL := e.baseURL + "/responses"
-
-	httpResp, account, _, err := e.sendWithRetry(ctx, rc, model, apiURL, codexBody, true)
+	bodyRC, account, _, _, _, _, _, err := e.openCodexResponsesBody(ctx, rc, requestBody, model)
 	if err != nil {
 		return nil, nil, err
 	}
-
-	return &RawResponse{StatusCode: httpResp.StatusCode, Body: httpResp.Body}, account, nil
+	return &RawResponse{StatusCode: http.StatusOK, Body: bodyRC}, account, nil
 }
 
 /**

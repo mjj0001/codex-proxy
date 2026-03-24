@@ -273,16 +273,17 @@ func ConvertClaudeRequestToOpenAI(claudeBody []byte) ([]byte, string, bool) {
  * @field HasToolUse - 是否包含工具调用
  */
 type ClaudeStreamState struct {
-	MessageID         string
-	Model             string
-	InputTokens       int64
-	ContentBlockIndex int
-	HasStartedContent bool
-	HasText           bool
-	HasToolUse        bool
-	HasThinking       bool
-	InThinkingBlock   bool
-	Completed         bool
+	MessageID           string
+	Model               string
+	InputTokens         int64
+	ContentBlockIndex   int
+	HasStartedContent   bool
+	HasText             bool
+	HasToolUse          bool
+	HasThinking         bool
+	InThinkingBlock     bool
+	Completed           bool
+	MessageStartEmitted bool /* 已发 message_start；上游若提前 EOF 须补 message_stop */
 }
 
 /**
@@ -343,6 +344,7 @@ func ConvertCodexStreamToClaudeEvents(_ context.Context, rawLine []byte, state *
 		msg, _ = sjson.Set(msg, "usage.output_tokens", 0)
 		msgStart, _ = sjson.SetRaw(msgStart, "message", msg)
 		events = append(events, formatClaudeSSE("message_start", msgStart))
+		state.MessageStartEmitted = true
 
 	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.reasoning.delta":
 		delta := root.Get("delta").String()

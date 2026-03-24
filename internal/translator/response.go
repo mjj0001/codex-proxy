@@ -80,9 +80,10 @@ func NewStreamState(model string) *StreamState {
  * @param rawLine - 原始 SSE 行数据
  * @param state - 流式状态对象
  * @param reverseToolMap - 缩短名→原始名的工具名映射
+ * @param usageFinalSeparateChunk - 为 true 时（客户端 stream_options.include_usage）不把 usage 写入本块，由调用方在 [DONE] 前单独发 choices 为 [] 的 usage 块，兼容 One API 等依赖该格式的网关计费
  * @returns []string - 转换后的 OpenAI 格式 JSON 字符串列表
  */
-func ConvertStreamChunk(_ context.Context, rawLine []byte, state *StreamState, reverseToolMap map[string]string) []string {
+func ConvertStreamChunk(_ context.Context, rawLine []byte, state *StreamState, reverseToolMap map[string]string, usageFinalSeparateChunk bool) []string {
 	if !bytes.HasPrefix(rawLine, dataPrefix) {
 		return nil
 	}
@@ -231,20 +232,22 @@ func ConvertStreamChunk(_ context.Context, rawLine []byte, state *StreamState, r
 			state.UsageInput = usage.Get("input_tokens").Int()
 			state.UsageOutput = usage.Get("output_tokens").Int()
 			state.UsageTotal = usage.Get("total_tokens").Int()
-			if v := usage.Get("output_tokens"); v.Exists() {
-				tpl, _ = sjson.Set(tpl, "usage.completion_tokens", v.Int())
-			}
-			if v := usage.Get("total_tokens"); v.Exists() {
-				tpl, _ = sjson.Set(tpl, "usage.total_tokens", v.Int())
-			}
-			if v := usage.Get("input_tokens"); v.Exists() {
-				tpl, _ = sjson.Set(tpl, "usage.prompt_tokens", v.Int())
-			}
-			if v := usage.Get("input_tokens_details.cached_tokens"); v.Exists() {
-				tpl, _ = sjson.Set(tpl, "usage.prompt_tokens_details.cached_tokens", v.Int())
-			}
-			if v := usage.Get("output_tokens_details.reasoning_tokens"); v.Exists() {
-				tpl, _ = sjson.Set(tpl, "usage.completion_tokens_details.reasoning_tokens", v.Int())
+			if !usageFinalSeparateChunk {
+				if v := usage.Get("output_tokens"); v.Exists() {
+					tpl, _ = sjson.Set(tpl, "usage.completion_tokens", v.Int())
+				}
+				if v := usage.Get("total_tokens"); v.Exists() {
+					tpl, _ = sjson.Set(tpl, "usage.total_tokens", v.Int())
+				}
+				if v := usage.Get("input_tokens"); v.Exists() {
+					tpl, _ = sjson.Set(tpl, "usage.prompt_tokens", v.Int())
+				}
+				if v := usage.Get("input_tokens_details.cached_tokens"); v.Exists() {
+					tpl, _ = sjson.Set(tpl, "usage.prompt_tokens_details.cached_tokens", v.Int())
+				}
+				if v := usage.Get("output_tokens_details.reasoning_tokens"); v.Exists() {
+					tpl, _ = sjson.Set(tpl, "usage.completion_tokens_details.reasoning_tokens", v.Int())
+				}
 			}
 		}
 
@@ -329,6 +332,26 @@ func ConvertStreamChunk(_ context.Context, rawLine []byte, state *StreamState, r
 	}
 
 	return []string{tpl}
+}
+
+/**
+ * BuildChatCompletionStreamUsageOnlyChunk 生成 OpenAI 流式收尾 chunk：choices 为 []，仅含 usage（与 stream_options.include_usage 一致，供 One API 等网关解析计费）。
+ */
+func BuildChatCompletionStreamUsageOnlyChunk(state *StreamState) string {
+	chunk := `{"id":"","object":"chat.completion.chunk","created":0,"model":"","choices":[]}`
+	chunk, _ = sjson.Set(chunk, "id", state.ResponseID)
+	chunk, _ = sjson.Set(chunk, "created", state.CreatedAt)
+	chunk, _ = sjson.Set(chunk, "model", state.Model)
+	prompt := state.UsageInput
+	completion := state.UsageOutput
+	total := state.UsageTotal
+	if total <= 0 && (prompt > 0 || completion > 0) {
+		total = prompt + completion
+	}
+	chunk, _ = sjson.Set(chunk, "usage.prompt_tokens", prompt)
+	chunk, _ = sjson.Set(chunk, "usage.completion_tokens", completion)
+	chunk, _ = sjson.Set(chunk, "usage.total_tokens", total)
+	return chunk
 }
 
 /**

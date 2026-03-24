@@ -3,6 +3,7 @@ package handler
 import (
 	"bufio"
 	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 
@@ -113,4 +114,26 @@ func newStreamBufWriter(w *bufio.Writer) *streamBufWriter {
 
 func (s *streamBufWriter) Write(p []byte) (int, error) {
 	return s.w.Write(p)
+}
+
+/*
+ * writeOpenAIChatCompletionSSEError 在已发送 200 + text/event-stream 后写入一条 data 错误 JSON，可选再写 [DONE]。
+ * 避免 Pump 失败时响应体完全为空，调试器与客户端能看到原因。
+ */
+func writeOpenAIChatCompletionSSEError(w *bufio.Writer, message, errType string, withDone bool) {
+	sw := newStreamBufWriter(w)
+	payload, mErr := json.Marshal(map[string]any{
+		"error": map[string]any{"message": message, "type": errType},
+	})
+	if mErr != nil {
+		payload = []byte(`{"error":{"message":"编码错误","type":"server_error"}}`)
+	}
+	_, _ = io.WriteString(sw, "data: ")
+	_, _ = sw.Write(payload)
+	_, _ = io.WriteString(sw, "\n\n")
+	_ = w.Flush()
+	if withDone {
+		_, _ = io.WriteString(sw, "data: [DONE]\n\n")
+		_ = w.Flush()
+	}
 }

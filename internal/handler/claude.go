@@ -114,7 +114,21 @@ func (h *ProxyHandler) executeClaudeStream(ctx *fasthttp.RequestCtx, rc executor
 			log.Errorf("Claude 读取流式响应失败: %v", scanErr)
 			return
 		}
+		/*
+		 * 无正文/工具/思考但已完成：response.completed 已发 message_stop，须记账。
+		 * 仅有 message_start 而上游提前 EOF：补发 message_delta + message_stop，避免客户端看到空 SSE。
+		 */
 		if !state.HasText && !state.HasToolUse && !state.HasThinking {
+			if !state.Completed && state.MessageStartEmitted {
+				closeEvents := translator.GenerateClaudeCloseEvents(state)
+				for _, event := range closeEvents {
+					_, _ = io.WriteString(sw, event)
+				}
+				flush()
+			}
+			if state.MessageStartEmitted || state.Completed {
+				account.RecordSuccess()
+			}
 			return
 		}
 		if !state.Completed {

@@ -311,6 +311,17 @@ func (h *ProxyHandler) buildRetryConfig() executor.RetryConfig {
 	return rc
 }
 
+/* chatStreamPumpErrorMeta 将 Pump 错误映射为 SSE data 内 OpenAI 风格 error.type/message */
+func chatStreamPumpErrorMeta(execErr error) (message, typ string) {
+	if errors.Is(execErr, executor.ErrEmptyResponse) {
+		return "上游未返回可解析的流式内容（空响应）", "bad_gateway"
+	}
+	if errors.Is(execErr, context.Canceled) {
+		return "请求已取消或上游连接中断", "request_cancelled"
+	}
+	return execErr.Error(), "api_error"
+}
+
 /**
  * handleExecutorError 统一处理 executor 返回的错误
  * @param ctx - FastHTTP 上下文
@@ -407,6 +418,8 @@ func (h *ProxyHandler) handleChatCompletions(ctx *fasthttp.RequestCtx) {
 			flush := func() { _ = w.Flush() }
 			if execErr := up.PumpChatCompletion(newStreamBufWriter(w), flush); execErr != nil {
 				log.Errorf("chat stream pump: %v", execErr)
+				msg, typ := chatStreamPumpErrorMeta(execErr)
+				writeOpenAIChatCompletionSSEError(w, msg, typ, true)
 				return
 			}
 			RecordRequest()
@@ -709,6 +722,8 @@ func (h *ProxyHandler) handleResponses(ctx *fasthttp.RequestCtx) {
 			flush := func() { _ = w.Flush() }
 			if execErr := up.PumpRawSSE(newStreamBufWriter(w), flush); execErr != nil {
 				log.Errorf("responses stream pump: %v", execErr)
+				msg, typ := chatStreamPumpErrorMeta(execErr)
+				writeOpenAIChatCompletionSSEError(w, msg, typ, true)
 				return
 			}
 			RecordRequest()
