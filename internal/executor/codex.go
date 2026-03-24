@@ -579,6 +579,7 @@ func (e *Executor) ExecuteNonStream(ctx context.Context, rc RetryConfig, request
 				break
 			}
 		}
+		scanErr := scanner.Err()
 		_ = httpResp.Body.Close()
 
 		if gotValid && len(result) > 0 {
@@ -586,9 +587,17 @@ func (e *Executor) ExecuteNonStream(ctx context.Context, rc RetryConfig, request
 			log.Infof("req summary nonstream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
 			return result, nil
 		}
-		/* 空回答时标记账号失败，防止下一个请求继续选择该账号 */
+		/* 空回答或读错误时标记账号失败，防止下一个请求继续选择该账号 */
 		account.RecordFailure()
 		excludedForEmpty[account.FilePath] = true
+		if scanErr != nil {
+			if isRetryableUpstreamReadErr(scanErr) && emptyAttempt < emptyRetryMax {
+				log.Warnf("nonstream 读 SSE 失败，换号重试 (%d/%d) account=%s: %v", emptyAttempt+1, emptyRetryMax+1, account.GetEmail(), wrapReadErr(scanErr))
+				continue
+			}
+			log.Infof("req summary nonstream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v (ERR)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
+			return nil, fmt.Errorf("读取响应失败: %w", wrapReadErr(scanErr))
+		}
 		if emptyAttempt < emptyRetryMax {
 			log.Warnf("非流式空返回，换号重试 (account=%s attempt=%d/%d)", account.GetEmail(), emptyAttempt+1, emptyRetryMax+1)
 		}

@@ -29,6 +29,9 @@ type CodexResponsesStream struct {
 	reverseTools map[string]string
 	/* IncludeUsage 为 true 时按 OpenAI stream_options.include_usage 在 [DONE] 前追加 choices 为 [] 的 usage 块 */
 	IncludeUsage bool
+	/* reopenFn 在 Pump 阶段遇可重试上游错误且尚未向客户端发送任何数据时，重新建立上游连接（可换号）。
+	 * 由 OpenCodexResponsesStream 设置；nil 表示不支持 pump 阶段重试。*/
+	reopenFn func(ctx context.Context) (io.ReadCloser, CodexResponsesMeta, error)
 }
 
 // CodexResponsesMeta bundles metadata returned by openCodexResponsesBody.
@@ -157,60 +160,97 @@ func (e *Executor) OpenCodexResponsesStream(ctx context.Context, rc RetryConfig,
 		SendDur:      meta.SendDur,
 		reverseTools: meta.ReverseTools,
 		IncludeUsage: includeUsage,
+		reopenFn: func(ctx context.Context) (io.ReadCloser, CodexResponsesMeta, error) {
+			return e.openCodexResponsesBody(ctx, rc, requestBody, model)
+		},
 	}, nil
 }
 
 // PumpChatCompletion 将 Codex SSE 转为 OpenAI Chat Completions 块写入 w（客户端 SSE 头须已由 handler 写好）。
+// 若 pump 阶段遇可重试上游错误且尚未向客户端发送任何 chunk，自动换号重建连接重试一次。
 func (s *CodexResponsesStream) PumpChatCompletion(w io.Writer, flush func()) error {
 	defer func() { _ = s.body.Close() }()
 
-	reverseToolMap := s.reverseTools
-	state := translator.NewStreamState(s.BaseModel)
-	scanner := bufio.NewScanner(s.body)
-	scanner.Buffer(make([]byte, scannerInitSize), scannerMaxSize)
 	streamStart := time.Now()
 	var firstChunkAt time.Time
 	var completedAt time.Time
 	chunkCount := 0
 	pumpCtx := context.Background()
 
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		chunks := translator.ConvertStreamChunk(pumpCtx, line, state, reverseToolMap, s.IncludeUsage)
-		for _, chunk := range chunks {
-			if firstChunkAt.IsZero() {
-				firstChunkAt = time.Now()
+	var state *translator.StreamState
+	var scanErr error
+
+	for round := 0; round < 2; round++ {
+		if round == 1 {
+			// 遇可重试上游错误且尚未向客户端发送任何 chunk 时换号重试
+			if !isRetryableUpstreamReadErr(scanErr) || chunkCount > 0 || s.reopenFn == nil {
+				break
 			}
-			chunkCount++
-			_, _ = w.Write(sseDataPrefix)
-			_, _ = io.WriteString(w, chunk)
-			_, _ = w.Write(sseDataSuffix)
-			if flush != nil {
-				flush()
+			_ = s.body.Close()
+			newBody, newMeta, rerr := s.reopenFn(pumpCtx)
+			if rerr != nil {
+				break
+			}
+			s.account.RecordFailure()
+			log.Warnf("stream pump 上游错误，换号重试 account=%s: %v", s.account.GetEmail(), wrapReadErr(scanErr))
+			s.account = newMeta.Account
+			s.Attempts += newMeta.Attempts
+			s.SendDur = newMeta.SendDur
+			s.body = newBody
+			s.reverseTools = newMeta.ReverseTools
+		}
+
+		state = translator.NewStreamState(s.BaseModel)
+		reverseToolMap := s.reverseTools
+		scanner := bufio.NewScanner(s.body)
+		scanner.Buffer(make([]byte, scannerInitSize), scannerMaxSize)
+
+		for scanner.Scan() {
+			line := scanner.Bytes()
+			chunks := translator.ConvertStreamChunk(pumpCtx, line, state, reverseToolMap, s.IncludeUsage)
+			for _, chunk := range chunks {
+				if firstChunkAt.IsZero() {
+					firstChunkAt = time.Now()
+				}
+				chunkCount++
+				_, _ = w.Write(sseDataPrefix)
+				_, _ = io.WriteString(w, chunk)
+				_, _ = w.Write(sseDataSuffix)
+				if flush != nil {
+					flush()
+				}
+			}
+			if state.Completed {
+				if completedAt.IsZero() {
+					completedAt = time.Now()
+				}
+				break
 			}
 		}
-		if state.Completed {
-			if completedAt.IsZero() {
-				completedAt = time.Now()
+
+		scanErr = scanner.Err()
+		if scanErr != nil {
+			if errors.Is(scanErr, context.Canceled) {
+				firstChunkDur := time.Duration(0)
+				if !firstChunkAt.IsZero() {
+					firstChunkDur = firstChunkAt.Sub(streamStart)
+				}
+				log.Infof("req summary stream model=%s account=%s attempts=%d convert=%v upstream_ttfb=%v first_chunk=%v to_completed=%v tail_after_completed=%v stream=%v chunks=%d total=%v (canceled)", s.BaseModel, s.account.GetEmail(), s.Attempts, s.ConvertDur, s.SendDur, firstChunkDur, time.Duration(0), time.Duration(0), time.Since(streamStart), chunkCount, time.Since(streamStart))
+				/* 已向客户端承诺 SSE：无任何 data 时须返回错误，避免 200 + 空体 */
+				if chunkCount == 0 {
+					return fmt.Errorf("读取流式响应中断: %w", scanErr)
+				}
+				return nil
 			}
-			break
+			// 非 Canceled 错误：进入下一轮检查是否可换号重试
+			continue
 		}
+		// 扫描正常结束，退出重试循环
+		break
 	}
 
-	if err := scanner.Err(); err != nil {
-		if errors.Is(err, context.Canceled) {
-			firstChunkDur := time.Duration(0)
-			if !firstChunkAt.IsZero() {
-				firstChunkDur = firstChunkAt.Sub(streamStart)
-			}
-			log.Infof("req summary stream model=%s account=%s attempts=%d convert=%v upstream_ttfb=%v first_chunk=%v to_completed=%v tail_after_completed=%v stream=%v chunks=%d total=%v (canceled)", s.BaseModel, s.account.GetEmail(), s.Attempts, s.ConvertDur, s.SendDur, firstChunkDur, time.Duration(0), time.Duration(0), time.Since(streamStart), chunkCount, time.Since(streamStart))
-			/* 已向客户端承诺 SSE：无任何 data 时须返回错误，避免 200 + 空体 */
-			if chunkCount == 0 {
-				return fmt.Errorf("读取流式响应中断: %w", err)
-			}
-			return nil
-		}
-		log.Errorf("读取流式响应失败: %v", err)
+	if scanErr != nil {
+		log.Errorf("读取流式响应失败: %v", scanErr)
 		firstChunkDur := time.Duration(0)
 		completedDur := time.Duration(0)
 		tailAfterCompleted := time.Duration(0)
@@ -222,8 +262,9 @@ func (s *CodexResponsesStream) PumpChatCompletion(w io.Writer, flush func()) err
 			tailAfterCompleted = time.Since(completedAt)
 		}
 		log.Infof("req summary stream model=%s account=%s attempts=%d convert=%v upstream_ttfb=%v first_chunk=%v to_completed=%v tail_after_completed=%v stream=%v chunks=%d total=%v (ERR)", s.BaseModel, s.account.GetEmail(), s.Attempts, s.ConvertDur, s.SendDur, firstChunkDur, completedDur, tailAfterCompleted, time.Since(streamStart), chunkCount, time.Since(streamStart))
-		return wrapReadErr(err)
+		return wrapReadErr(scanErr)
 	}
+
 	/* response.completed 会写出带 finish_reason 的 chunk，但未必有正文；仍视为有效流并须写 [DONE] */
 	if !state.HasText && !state.HasToolCall && !state.HasReasoning && !state.Completed {
 		firstChunkDur := time.Duration(0)
@@ -296,35 +337,64 @@ func (s *CodexResponsesStream) PumpChatCompletion(w io.Writer, flush func()) err
 }
 
 // PumpRawSSE 原样转发上游 SSE 字节（Responses API）。
+// 若 pump 阶段遇可重试上游错误且尚未向客户端写入任何字节，自动换号重建连接重试一次。
 func (s *CodexResponsesStream) PumpRawSSE(w io.Writer, flush func()) error {
 	defer func() { _ = s.body.Close() }()
 	buf := make([]byte, httpBufferSize)
 	streamStart := time.Now()
-	for {
-		n, readErr := s.body.Read(buf)
-		if n > 0 {
-			if _, werr := w.Write(buf[:n]); werr != nil {
-				return werr
+	bytesWritten := 0
+	var pumpErr error
+
+	for round := 0; round < 2; round++ {
+		if round == 1 {
+			// 遇可重试上游错误且尚未向客户端写入任何字节时换号重试
+			if !isRetryableUpstreamReadErr(pumpErr) || bytesWritten > 0 || s.reopenFn == nil {
+				break
 			}
-			if flush != nil {
-				flush()
+			_ = s.body.Close()
+			newBody, newMeta, rerr := s.reopenFn(context.Background())
+			if rerr != nil {
+				break
 			}
+			s.account.RecordFailure()
+			log.Warnf("responses-stream pump 上游错误，换号重试 account=%s: %v", s.account.GetEmail(), wrapReadErr(pumpErr))
+			s.account = newMeta.Account
+			s.Attempts += newMeta.Attempts
+			s.SendDur = newMeta.SendDur
+			s.body = newBody
 		}
-		if readErr != nil {
-			if readErr == io.EOF {
-				s.account.RecordSuccess()
-				log.Infof("req summary responses-stream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v", s.BaseModel, s.account.GetEmail(), s.Attempts, s.ConvertDur, s.SendDur, time.Since(streamStart))
-				return nil
+
+		pumpErr = nil
+		for {
+			n, readErr := s.body.Read(buf)
+			if n > 0 {
+				if _, werr := w.Write(buf[:n]); werr != nil {
+					return werr
+				}
+				bytesWritten += n
+				if flush != nil {
+					flush()
+				}
 			}
-			if errors.Is(readErr, context.Canceled) {
-				log.Infof("req summary responses-stream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v (canceled)", s.BaseModel, s.account.GetEmail(), s.Attempts, s.ConvertDur, s.SendDur, time.Since(streamStart))
-				return nil
+			if readErr != nil {
+				if readErr == io.EOF {
+					s.account.RecordSuccess()
+					log.Infof("req summary responses-stream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v", s.BaseModel, s.account.GetEmail(), s.Attempts, s.ConvertDur, s.SendDur, time.Since(streamStart))
+					return nil
+				}
+				if errors.Is(readErr, context.Canceled) {
+					log.Infof("req summary responses-stream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v (canceled)", s.BaseModel, s.account.GetEmail(), s.Attempts, s.ConvertDur, s.SendDur, time.Since(streamStart))
+					return nil
+				}
+				pumpErr = readErr
+				break
 			}
-			log.Errorf("读取流式响应失败: %v", readErr)
-			log.Infof("req summary responses-stream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v (ERR)", s.BaseModel, s.account.GetEmail(), s.Attempts, s.ConvertDur, s.SendDur, time.Since(streamStart))
-			return wrapReadErr(readErr)
 		}
 	}
+
+	log.Errorf("读取流式响应失败: %v", pumpErr)
+	log.Infof("req summary responses-stream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v (ERR)", s.BaseModel, s.account.GetEmail(), s.Attempts, s.ConvertDur, s.SendDur, time.Since(streamStart))
+	return wrapReadErr(pumpErr)
 }
 
 // CodexCompactStream /responses/compact 成功后的响应（含待透传头与 Body）。
