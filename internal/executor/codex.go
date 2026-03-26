@@ -161,6 +161,8 @@ type RetryConfig struct {
 	QuotaCheckFn  func(ctx context.Context, acc *auth.Account) bool
 	MaxRetry      int
 	EmptyRetryMax int
+	/* DebugUpstreamStream 为 true 时 Pump* 将上游 SSE 原始字节打到日志（见 stream.go） */
+	DebugUpstreamStream bool
 }
 
 /**
@@ -239,12 +241,42 @@ func isRetryableUpstreamReadErr(err error) bool {
 	return strings.Contains(s, "GOAWAY") || strings.Contains(s, "ENHANCE_YOUR_CALM")
 }
 
+/*
+ * PumpShouldReopenNoClientBytes 上游已 2xx 且响应体尚未向客户端写入任何字节时，是否允许在 pump 内关 body 并换号。
+ * 除 context.Canceled 外一律 true（含 io.EOF、scanner 超长、非 GOAWAY 的读错误等），与「只要没发往客户端就换号」一致。
+ */
+func PumpShouldReopenNoClientBytes(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	return true
+}
+
 /* IsRetryableStreamPumpError 上游 SSE 读阶段错误是否适合在响应体仍为空时全量重连（与 isRetryableUpstreamReadErr 一致） */
 func IsRetryableStreamPumpError(err error) bool {
 	return isRetryableUpstreamReadErr(err)
 }
 
-/* IsRetryableOpenCodexError OpenCodexResponsesStream 失败是否适合在尚未写出响应体时整段重试 */
+/*
+ * IsRetryableStreamPumpForBridge 与 RunCodexStreamWithOpenBridges 配合：written==0 时是否再做一次「全量重连」。
+ * 除取消与本地构建请求失败外均允许换号，避免仅 GOAWAY 等才被重试。
+ */
+func IsRetryableStreamPumpForBridge(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, errCodexBuildRequest) {
+		return false
+	}
+	return true
+}
+
 func IsRetryableOpenCodexError(err error) bool {
 	if err == nil {
 		return false

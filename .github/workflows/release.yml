@@ -196,10 +196,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Docker/OCI 引用要求仓库路径全小写；github.repository 可能含大写组织名。
+      - name: GHCR 镜像基址（小写）
+        id: ghcr
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
       - id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ steps.ghcr.outputs.image }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -215,7 +220,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: |
             type=gha,scope=codex-proxy-docker
-            type=registry,ref=ghcr.io/${{ github.repository }}:buildcache
+            type=registry,ref=${{ steps.ghcr.outputs.image }}:buildcache
           cache-to: |
             type=gha,mode=max,scope=codex-proxy-docker
-            type=registry,ref=ghcr.io/${{ github.repository }}:buildcache,mode=max
+            type=registry,ref=${{ steps.ghcr.outputs.image }}:buildcache,mode=max

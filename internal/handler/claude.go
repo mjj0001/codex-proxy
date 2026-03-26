@@ -21,6 +21,78 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
+/*
+ * pumpClaudeCodexSSE 将 Codex /responses SSE 译为 Claude Messages 流式事件写入 w。
+ * 须关闭 s.body（与 PumpChatCompletion 一致）；若尚未向客户端写出任何事件且上游无有效内容，返回 ErrEmptyResponse 以触发换号/全量重连。
+ */
+func pumpClaudeCodexSSE(s *executor.CodexResponsesStream, w io.Writer, flush func(), model string, debugUpstream bool) error {
+	body := s.UpstreamBody()
+	defer func() { _ = body.Close() }()
+	state := translator.NewClaudeStreamState(model)
+	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, scannerInitSize), scannerMaxSize)
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if debugUpstream {
+			ae := ""
+			if acc := s.StreamAccount(); acc != nil {
+				ae = acc.GetEmail()
+			}
+			executor.LogUpstreamStreamChunk("claude_sse_line", model, ae, line)
+		}
+		events := translator.ConvertCodexStreamToClaudeEvents(line, state)
+		for _, event := range events {
+			_, _ = io.WriteString(w, event)
+			if flush != nil {
+				flush()
+			}
+		}
+		if state.Completed {
+			break
+		}
+	}
+
+	if scanErr := scanner.Err(); scanErr != nil {
+		if errors.Is(scanErr, context.Canceled) {
+			return fmt.Errorf("读取流式响应中断: %w", scanErr)
+		}
+		return fmt.Errorf("读取 Claude 上游 SSE 失败: %w", scanErr)
+	}
+
+	if !state.HasText && !state.HasToolUse && !state.HasThinking {
+		if !state.Completed && state.MessageStartEmitted {
+			closeEvents := translator.GenerateClaudeCloseEvents(state)
+			for _, event := range closeEvents {
+				_, _ = io.WriteString(w, event)
+				if flush != nil {
+					flush()
+				}
+			}
+		}
+		if state.MessageStartEmitted || state.Completed {
+			if acc := s.StreamAccount(); acc != nil {
+				acc.RecordSuccess()
+			}
+			return nil
+		}
+		return executor.ErrEmptyResponse
+	}
+	if !state.Completed {
+		closeEvents := translator.GenerateClaudeCloseEvents(state)
+		for _, event := range closeEvents {
+			_, _ = io.WriteString(w, event)
+			if flush != nil {
+				flush()
+			}
+		}
+	}
+	if acc := s.StreamAccount(); acc != nil {
+		acc.RecordSuccess()
+	}
+	return nil
+}
+
 /**
  * handleMessages 处理 Claude Messages API 请求（/v1/messages）
  * 将 Claude 格式请求转换为 OpenAI 格式 → executor 内部选择账号/重试 → 响应转回 Claude 格式
@@ -69,75 +141,28 @@ func (h *ProxyHandler) handleMessages(ctx *fasthttp.RequestCtx) {
  * @returns error - 执行失败时返回错误
  */
 func (h *ProxyHandler) executeClaudeStream(ctx *fasthttp.RequestCtx, rc executor.RetryConfig, openaiBody []byte, model string) error {
-	rawResp, account, err := h.executor.ExecuteRawCodexStream(ctx, rc, openaiBody, model)
-	if err != nil {
-		return err
-	}
-
-	/* 只有到这里才开始写 SSE 头（重试在 executor 内部已完成）；Body 须在 StreamWriter 内关闭，避免 defer 早于异步写协程执行 */
+	/* 只有到这里才开始写 SSE 头；Open+Pump 在 StreamWriter 内完成，响应体尚无字节时可内部换号与全量重连 */
 	ctx.Response.Header.Set("Content-Type", "text/event-stream")
 	ctx.Response.Header.Set("Cache-Control", "no-cache")
 	ctx.Response.Header.Set("Connection", "keep-alive")
 	ctx.SetStatusCode(fasthttp.StatusOK)
 
-	/* StreamWriter 内勿使用 RequestCtx（fasthttp 文档）；翻译用 Background，取消/断连由上游 Body 读错误体现 */
 	ctx.SetBodyStreamWriter(func(w *bufio.Writer) {
-		defer func() {
-			if rawResp.Body != nil {
-				_ = rawResp.Body.Close()
-			}
-		}()
 		sw := newStreamBufWriter(w)
 		flush := func() { _ = w.Flush() }
-		state := translator.NewClaudeStreamState(model)
-
-		scanner := bufio.NewScanner(rawResp.Body)
-		scanner.Buffer(make([]byte, scannerInitSize), scannerMaxSize)
-
-		for scanner.Scan() {
-			line := scanner.Bytes()
-			events := translator.ConvertCodexStreamToClaudeEvents(line, state)
-			for _, event := range events {
-				_, _ = io.WriteString(sw, event)
-				flush()
+		bridges := executor.CodexStreamOpenBridgeMax(h.maxRetry)
+		execErr := h.executor.RunCodexStreamWithOpenBridges(context.Background(), rc, openaiBody, model, sw, flush, bridges, func(s *executor.CodexResponsesStream, w2 io.Writer, fl func()) error {
+			return pumpClaudeCodexSSE(s, w2, fl, model, h.debugUpstreamStream)
+		})
+		if execErr != nil {
+			log.Errorf("Claude stream: %v", execErr)
+			msg := execErr.Error()
+			if errors.Is(execErr, executor.ErrEmptyResponse) {
+				msg = "上游未返回有效内容（空响应）"
 			}
-			if state.Completed {
-				break
-			}
+			_, _ = fmt.Fprintf(w, "event: error\ndata: {\"type\":\"error\",\"message\":%q}\n\n", msg)
+			_ = w.Flush()
 		}
-
-		if scanErr := scanner.Err(); scanErr != nil {
-			if errors.Is(scanErr, context.Canceled) {
-				return
-			}
-			log.Errorf("Claude 读取流式响应失败: %v", scanErr)
-			return
-		}
-		/*
-		 * 无正文/工具/思考但已完成：response.completed 已发 message_stop，须记账。
-		 * 仅有 message_start 而上游提前 EOF：补发 message_delta + message_stop，避免客户端看到空 SSE。
-		 */
-		if !state.HasText && !state.HasToolUse && !state.HasThinking {
-			if !state.Completed && state.MessageStartEmitted {
-				closeEvents := translator.GenerateClaudeCloseEvents(state)
-				for _, event := range closeEvents {
-					_, _ = io.WriteString(sw, event)
-				}
-				flush()
-			}
-			if state.MessageStartEmitted || state.Completed {
-				account.RecordSuccess()
-			}
-			return
-		}
-		if !state.Completed {
-			closeEvents := translator.GenerateClaudeCloseEvents(state)
-			for _, event := range closeEvents {
-				_, _ = io.WriteString(sw, event)
-			}
-			flush()
-		}
-		account.RecordSuccess()
 	})
 
 	if !ctx.Response.IsBodyStream() {

@@ -56,6 +56,9 @@ backend-domain: "chatgpt.com"
 # 日志级别: debug, info, warn, error
 log-level: "info"
 
+# 排障：按行/块 Info 打印上游 Codex SSE 原始内容（Chat 与 Responses 流式）；日志量极大且可能含用户数据，用完请关闭
+# debug-upstream-stream: true
+
 # Token 自动刷新间隔（秒）
 refresh-interval: 3000
 

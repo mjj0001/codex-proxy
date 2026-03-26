@@ -282,7 +282,7 @@ func main() {
 
 	/* 初始化 HTTP 服务 */
 	r := router.New()
-	proxyHandler := handler.NewProxyHandler(manager, exec, cfg.APIKeys, cfg.MaxRetry, cfg.EnableHealthyRetry, cfg.ProxyURL, cfg.BaseURL, cfg.EnableHTTP2, cfg.BackendDomain, cfg.BackendResolveAddress, cfg.QuotaCheckConcurrency, quotaChecker, cfg.EmptyRetryMax, static.IndexHTML)
+	proxyHandler := handler.NewProxyHandler(manager, exec, cfg.APIKeys, cfg.MaxRetry, cfg.EnableHealthyRetry, cfg.ProxyURL, cfg.BaseURL, cfg.EnableHTTP2, cfg.BackendDomain, cfg.BackendResolveAddress, cfg.QuotaCheckConcurrency, quotaChecker, cfg.EmptyRetryMax, cfg.DebugUpstreamStream, static.IndexHTML)
 	proxyHandler.RegisterRoutes(r)
 
 	appHandler := r.Handler

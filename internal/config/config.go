@@ -46,6 +46,8 @@ type Config struct {
 	BackendResolveAddress  string `yaml:"backend-resolve-address"`
 	BaseURL                string `yaml:"base-url"`
 	LogLevel               string `yaml:"log-level"`
+	/* DebugUpstreamStream 为 true 时按行/块 Info 打印上游 SSE 原始内容，日志量大且可能含隐私，仅排障时短期开启 */
+	DebugUpstreamStream bool `yaml:"debug-upstream-stream"`
 	RefreshInterval        int    `yaml:"refresh-interval"`
 	MaxRetry               int    `yaml:"max-retry"`
 	EnableHealthyRetry     bool   `yaml:"enable-healthy-retry"`

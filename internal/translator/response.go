@@ -51,6 +51,46 @@ type StreamState struct {
 	UsageTotal               int64
 	reasoningDeltaByItem     map[string]string
 	hasReasoningSummaryDelta bool
+
+	/* 空响应排查：每条有效 data: JSON 行计数及首尾 type（仅日志） */
+	diagUpstreamDataLines int
+	diagFirstEventType    string
+	diagLastEventType     string
+	/* 上游 SSE 级错误（error / response.failed），无 Chat delta 时仍应换号重试 */
+	UpstreamErrCode string
+	UpstreamErrMsg  string
+}
+
+func (s *StreamState) noteUpstreamDataEvent(dataType string) {
+	if s == nil {
+		return
+	}
+	s.diagUpstreamDataLines++
+	if dataType == "" {
+		return
+	}
+	if s.diagFirstEventType == "" {
+		s.diagFirstEventType = dataType
+	}
+	s.diagLastEventType = dataType
+}
+
+// EmptyUpstreamDiag 供 executor 在 ErrEmptyResponse 时打日志（不含请求体原文）
+func (s *StreamState) EmptyUpstreamDiag(pumpScanLines int) string {
+	if s == nil {
+		return "state=nil"
+	}
+	base := fmt.Sprintf("upstream_scan_lines=%d upstream_data_events=%d first_type=%q last_type=%q response_id=%q codex_completed=%v mapped(text=%v tool=%v reasoning=%v)",
+		pumpScanLines, s.diagUpstreamDataLines, s.diagFirstEventType, s.diagLastEventType, s.ResponseID, s.Completed, s.HasText, s.HasToolCall, s.HasReasoning)
+	if s.UpstreamErrCode != "" || s.UpstreamErrMsg != "" {
+		msg := s.UpstreamErrMsg
+		const maxMsg = 240
+		if len(msg) > maxMsg {
+			msg = msg[:maxMsg] + "…(truncated)"
+		}
+		return base + fmt.Sprintf(" upstream_sse_error code=%q msg=%q", s.UpstreamErrCode, msg)
+	}
+	return base
 }
 
 /**
@@ -94,6 +134,7 @@ func ConvertStreamChunk(_ context.Context, rawLine []byte, state *StreamState, r
 
 	root := gjson.ParseBytes(rawJSON)
 	dataType := root.Get("type").String()
+	state.noteUpstreamDataEvent(dataType)
 	if dataType == "response.created" {
 		state.ResponseID = root.Get("response.id").String()
 		state.CreatedAt = root.Get("response.created_at").Int()
@@ -221,6 +262,10 @@ func ConvertStreamChunk(_ context.Context, rawLine []byte, state *StreamState, r
 
 	case "response.completed":
 		state.Completed = true
+		/* 上游已 completed 但无任何正文/工具/思维：不向客户端发 finish_reason chunk，由 executor 按空流换号，避免 chunkCount>0 阻断重试 */
+		if !state.HasText && !state.HasToolCall && !state.HasReasoning {
+			return nil
+		}
 		finishReason := "stop"
 		if state.FunctionCallIndex != -1 {
 			finishReason = "tool_calls"
@@ -318,6 +363,25 @@ func ConvertStreamChunk(_ context.Context, rawLine []byte, state *StreamState, r
 		tpl, _ = sjson.Set(tpl, "choices.0.delta.role", "assistant")
 		tpl, _ = sjson.SetRaw(tpl, "choices.0.delta.tool_calls", `[]`)
 		tpl, _ = sjson.SetRaw(tpl, "choices.0.delta.tool_calls.-1", fc)
+
+	case "error":
+		state.UpstreamErrCode = root.Get("error.type").String()
+		if state.UpstreamErrCode == "" {
+			state.UpstreamErrCode = root.Get("error.code").String()
+		}
+		state.UpstreamErrMsg = root.Get("error.message").String()
+		return nil
+
+	case "response.failed":
+		if code := root.Get("response.error.code").String(); code != "" {
+			state.UpstreamErrCode = code
+		} else if t := root.Get("response.error.type").String(); t != "" {
+			state.UpstreamErrCode = t
+		}
+		if msg := root.Get("response.error.message").String(); msg != "" {
+			state.UpstreamErrMsg = msg
+		}
+		return nil
 
 	default:
 		if strings.Contains(dataType, "reasoning") && strings.HasSuffix(dataType, ".delta") {
