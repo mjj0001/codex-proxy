@@ -14,6 +14,9 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+/* DefaultDisabledRecoveryIntervalSec 仅磁盘凭据：周期性恢复 *.json.disabled 并探测 OAuth/额度，失败则删文件，减少残留占盘。YAML 省略本项时使用。设为 0 关闭。 */
+const DefaultDisabledRecoveryIntervalSec = 3600
+
 /**
  * Config 是 Codex 代理服务的顶层配置结构
  * @field Listen - 监听地址，格式为 host:port
@@ -38,27 +41,27 @@ type Config struct {
 	DBSSLMode  string `yaml:"db-sslmode"`
 	DBDSN      string `yaml:"db-dsn"`
 	/* DBMaxOpenConns / DBMaxIdleConns 为 0 时按 refresh-concurrency 自动估算 */
-	DBMaxOpenConns         int    `yaml:"db-max-open-conns"`
-	DBMaxIdleConns         int    `yaml:"db-max-idle-conns"`
-	DBConnMaxLifetimeSec   int    `yaml:"db-conn-max-lifetime-sec"` /* 0 默认 1800（30m） */
-	ProxyURL               string `yaml:"proxy-url"`
-	BackendDomain          string `yaml:"backend-domain"`
-	BackendResolveAddress  string `yaml:"backend-resolve-address"`
-	BaseURL                string `yaml:"base-url"`
-	LogLevel               string `yaml:"log-level"`
+	DBMaxOpenConns        int    `yaml:"db-max-open-conns"`
+	DBMaxIdleConns        int    `yaml:"db-max-idle-conns"`
+	DBConnMaxLifetimeSec  int    `yaml:"db-conn-max-lifetime-sec"` /* 0 默认 1800（30m） */
+	ProxyURL              string `yaml:"proxy-url"`
+	BackendDomain         string `yaml:"backend-domain"`
+	BackendResolveAddress string `yaml:"backend-resolve-address"`
+	BaseURL               string `yaml:"base-url"`
+	LogLevel              string `yaml:"log-level"`
 	/* DebugUpstreamStream 为 true 时按行/块 Info 打印上游 SSE 原始内容，日志量大且可能含隐私，仅排障时短期开启 */
-	DebugUpstreamStream bool `yaml:"debug-upstream-stream"`
-	RefreshInterval        int    `yaml:"refresh-interval"`
-	MaxRetry               int    `yaml:"max-retry"`
-	EnableHealthyRetry     bool   `yaml:"enable-healthy-retry"`
-	HealthCheckInterval    int    `yaml:"health-check-interval"`
-	HealthCheckMaxFailures int    `yaml:"health-check-max-failures"`
-	HealthCheckConcurrency int    `yaml:"health-check-concurrency"`
-	HealthCheckStartDelay  int    `yaml:"health-check-start-delay"`
-	HealthCheckBatchSize   int    `yaml:"health-check-batch-size"`
+	DebugUpstreamStream    bool `yaml:"debug-upstream-stream"`
+	RefreshInterval        int  `yaml:"refresh-interval"`
+	MaxRetry               int  `yaml:"max-retry"`
+	EnableHealthyRetry     bool `yaml:"enable-healthy-retry"`
+	HealthCheckInterval    int  `yaml:"health-check-interval"`
+	HealthCheckMaxFailures int  `yaml:"health-check-max-failures"`
+	HealthCheckConcurrency int  `yaml:"health-check-concurrency"`
+	HealthCheckStartDelay  int  `yaml:"health-check-start-delay"`
+	HealthCheckBatchSize   int  `yaml:"health-check-batch-size"`
 	/* HealthCheckReqTimeout 定时健康检查单次请求超时（秒），与对话转发无关 */
 	HealthCheckReqTimeout int `yaml:"health-check-request-timeout"`
-	/* DisabledRecoveryIntervalSec 仅磁盘凭据：周期性将 *.json.disabled 还原为 .json，OAuth+额度探测，失败则删文件；0 关闭 */
+	/* DisabledRecoveryIntervalSec 仅磁盘凭据：周期性将 *.json.disabled 还原为 .json，OAuth+额度探测，失败则删文件；0 关闭。默认见 DefaultDisabledRecoveryIntervalSec */
 	DisabledRecoveryIntervalSec int  `yaml:"disabled-recovery-interval-sec"`
 	RefreshConcurrency          int  `yaml:"refresh-concurrency"`
 	MaxConnsPerHost             int  `yaml:"max-conns-per-host"`
@@ -141,7 +144,7 @@ func LoadConfig(path string) (*Config, error) {
 		HealthCheckStartDelay:       45,
 		HealthCheckBatchSize:        20,
 		HealthCheckReqTimeout:       8,
-		DisabledRecoveryIntervalSec: 0,
+		DisabledRecoveryIntervalSec: DefaultDisabledRecoveryIntervalSec,
 		RefreshConcurrency:          50,
 		MaxConnsPerHost:             12, /* 配合 HTTP/2 降低 GOAWAY ENHANCE_YOUR_CALM 概率 */
 		MaxIdleConns:                48,

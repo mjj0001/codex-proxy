@@ -116,8 +116,8 @@ health-check-batch-size: 20
 # 定时健康检查单次请求超时（秒）；仅影响后台巡检，不影响对话 API
 health-check-request-timeout: 8
 
-# disabled-recovery-interval-sec: 3600
-# 仅磁盘 JSON（db-enabled: false）：周期将 *.json.disabled 还原为 .json，OAuth 刷新并同步查额度；不通过则删除凭据（不再改回 .disabled）。0 表示关闭。启动后约 90s 首次执行。
+# 仅磁盘 JSON（db-enabled: false）：周期将 *.json.disabled 还原为 .json，OAuth 刷新并同步查额度；不通过则删除凭据（不再改回 .disabled），避免目录堆积大文件。默认 3600（秒，约 1 小时）；启动后约 90s 首次执行。db-enabled: true 时不跑此逻辑。
+# disabled-recovery-interval-sec: 0
 
 # Token 并发刷新数（2w 账号建议 100-200）
 refresh-concurrency: 50
@@ -176,12 +176,14 @@ max-idle-conns-per-host: 512
 # 是否启用出站 HTTP/2（关闭则强制 HTTP/1.1，多连接并行通常更稳）
 enable-http2: false
 
-# 管理类 HTTP 接口（若配置了 api-keys 则需带相同 Key）:
-#   POST /recover-auth  — 401 恢复：同步刷新 token；刷新 429 时查额度；仍失败则凭据重命名为 *.json.disabled
+# 管理类 HTTP / WebSocket 接口（若配置了 api-keys 则需带相同 Key；详见 docs/API-ADMIN.md）:
+#   POST /recover-auth           — 401 恢复：同步刷新 token；刷新 429 时查额度；仍失败则凭据重命名为 *.json.disabled
 #     请求体: {"email":"a@b.com"} 或 {"file_path":"账号.json"} 或 {"all":true}
-#   POST /refresh        — SSE 流式强制刷新全部账号
-#   POST /check-quota    — SSE 流式查询额度
-#   GET  /stats          — 账号统计
+#   POST /refresh                — SSE 流式强制刷新全部账号
+#   POST /check-quota            — SSE 流式查询额度
+#   GET  /stats                  — 账号统计
+#   POST /admin/accounts/ingest  — 导入账号：body 为单个 JSON 对象、数组或 NDJSON；磁盘模式需 auth-dir，DB 模式 upsert 数据库
+#   GET|POST + Upgrade: websocket 同上 URL — WebSocket 文本帧，每帧 payload 与 POST body 语义相同
 #
 # API Key 鉴权（可选，为空则不鉴权）
 # api-keys:

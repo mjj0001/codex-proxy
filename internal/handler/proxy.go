@@ -72,9 +72,9 @@ type ProxyHandler struct {
 	maxRetry             int
 	enableHealthyRetry   bool
 	quotaChecker         *auth.QuotaChecker
-	indexHTML           []byte
-	emptyRetryMax       int
-	debugUpstreamStream bool /* 配置 debug-upstream-stream：打印上游 SSE 原文 */
+	indexHTML            []byte
+	emptyRetryMax        int
+	debugUpstreamStream  bool     /* 配置 debug-upstream-stream：打印上游 SSE 原文 */
 	auth401RecoverTracks sync.Map /* key: filePath, value: *auth401RecoverTrack */
 }
 
@@ -170,6 +170,13 @@ func (h *ProxyHandler) RegisterRoutes(r *fasthttprouter.Router) {
 	r.POST("/refresh", refreshHandler)
 	r.POST("/check-quota", checkQuotaHandler)
 	r.POST("/recover-auth", recoverAuthHandler)
+
+	accountsIngestHandler := h.handleAccountsIngest
+	if len(h.apiKeys) > 0 {
+		accountsIngestHandler = h.authMiddleware(h.handleAccountsIngest)
+	}
+	r.POST("/admin/accounts/ingest", accountsIngestHandler)
+	r.GET("/admin/accounts/ingest", accountsIngestHandler)
 }
 
 /**
@@ -340,9 +347,9 @@ func (h *ProxyHandler) buildRetryConfig() executor.RetryConfig {
 				return true
 			}
 		},
-		MaxRetry:              h.maxRetry,
-		EmptyRetryMax:         h.emptyRetryMax,
-		DebugUpstreamStream:   h.debugUpstreamStream,
+		MaxRetry:            h.maxRetry,
+		EmptyRetryMax:       h.emptyRetryMax,
+		DebugUpstreamStream: h.debugUpstreamStream,
 	}
 	if h.enableHealthyRetry {
 		rc.HealthyPickFn = healthyPick

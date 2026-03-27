@@ -114,7 +114,10 @@ location / {
 
 - 进程存活：`GET /health`
 - 账号与额度概览：`GET /stats`（若配置了 `api-keys` 需带 Key）
-- 手动刷新 Token：`POST /refresh`；查询额度：`POST /check-quota`（均为管理类接口，行为见 [配置说明](CONFIGURATION.md) 与 `config.example.yaml` 注释）
+- 手动刷新 Token：`POST /refresh`；查询额度：`POST /check-quota`
+- 运行时导入账号：`POST /admin/accounts/ingest`（或同路径 WebSocket），无需把文件拷进容器卷即可填充号池  
+
+上述管理类接口的鉴权、请求体与示例见 **[API-ADMIN.md](API-ADMIN.md)**；字段级说明仍见 [配置说明](CONFIGURATION.md) 与 `config.example.yaml`。
 
 升级时：先备份 `auths/` 或数据库，替换二进制/镜像后滚动重启即可；配置支持热扫描账号目录（`auth-scan-interval`）。
 

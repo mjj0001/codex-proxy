@@ -84,7 +84,7 @@
 | `health-check-start-delay`       | `45`  | 启动后延迟开始巡检（秒）。                           |
 | `health-check-batch-size`        | `20`  | 每轮最多抽查数量；`0` 表示全量。                      |
 | `health-check-request-timeout`   | `8`   | 单次巡检请求超时（秒）。                            |
-| `disabled-recovery-interval-sec` | `0`   | 仅磁盘 JSON：周期恢复 `*.json.disabled`；`0` 关闭。 |
+| `disabled-recovery-interval-sec` | `3600` | 仅磁盘 JSON（`db-enabled: false`）：周期恢复 `*.json.disabled`，OAuth+额度探测，失败则**删除凭据**，减少残留文件占盘；**`0` 关闭**。`db-enabled: true` 时此项不生效。 |
 
 
 ## 连接池与 HTTP/2
@@ -132,6 +132,16 @@
 | ------------------------- | --- | --------------------------------------------------------- |
 | `api-keys`                | 空   | 非空时，客户端需在 `Authorization: Bearer <key>` 中携带其一；**为空则不校验**。 |
 | `quota-check-concurrency` | `0` | `0` 表示使用 `refresh-concurrency`。                           |
+
+
+## 管理类 HTTP / WebSocket 接口
+
+与对话 API 共用 `listen` 端口。除 `/health` 等少数路径外，若配置了 `api-keys`，管理接口同样要求 `Authorization: Bearer`。
+
+- **账号导入**：`POST /admin/accounts/ingest`（或同 URL 的 WebSocket 升级），用于运行时向号池写入凭据；磁盘模式依赖 `auth-dir`，数据库模式见上文 `db-enabled`。  
+- **其他**：`/stats`、`/refresh`、`/check-quota`、`/recover-auth` 等。
+
+完整说明、请求体格式、响应字段与安全建议见 **[API-ADMIN.md](API-ADMIN.md)**。
 
 
 ## 命令行参数
