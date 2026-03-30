@@ -329,6 +329,9 @@ func (h *ProxyHandler) buildRetryConfig() executor.RetryConfig {
 			if h.quotaChecker == nil {
 				return true
 			}
+			if acc != nil && !acc.HasRefreshToken() {
+				return true
+			}
 			/* verdict: 1=额度有效；0/2=暂态失败或 429，仍尝试上游；-1=明确无效，不重试浪费上游 */
 			verdict := h.quotaChecker.CheckAccountResult(ctx, acc)
 			switch verdict {

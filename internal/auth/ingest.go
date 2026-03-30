@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+
+	log "github.com/sirupsen/logrus"
 )
 
 /**
@@ -112,11 +114,44 @@ func ingestSyntheticAccountID(refreshToken string) string {
 }
 
 /**
+ * ingestIdentitySeed 生成合成 account_id 的熵源；无 rk 时用 access_token / id_token，避免多条上传撞同一 id
+ */
+func ingestIdentitySeed(acc *Account) string {
+	if acc == nil {
+		return ""
+	}
+	if s := strings.TrimSpace(acc.Token.RefreshToken); s != "" {
+		return s
+	}
+	if s := strings.TrimSpace(acc.Token.AccessToken); s != "" {
+		return s
+	}
+	return strings.TrimSpace(acc.Token.IDToken)
+}
+
+func ingestLogIdent(acc *Account) string {
+	if acc == nil {
+		return ""
+	}
+	if s := strings.TrimSpace(acc.Token.Email); s != "" {
+		return s
+	}
+	if s := strings.TrimSpace(acc.Token.AccountID); s != "" {
+		return s
+	}
+	return acc.FilePath
+}
+
+/**
  * ensureIngestDBIdentity 数据库模式下保证 account_id 与 email 至少有一个非空，以便 upsert 与 FilePath 稳定
  */
 func ensureIngestDBIdentity(acc *Account) {
 	if strings.TrimSpace(acc.Token.AccountID) == "" && strings.TrimSpace(acc.Token.Email) == "" {
-		acc.Token.AccountID = ingestSyntheticAccountID(acc.Token.RefreshToken)
+		seed := ingestIdentitySeed(acc)
+		if seed == "" {
+			seed = "empty"
+		}
+		acc.Token.AccountID = ingestSyntheticAccountID(seed)
 	}
 }
 
@@ -124,27 +159,33 @@ func (m *Manager) ingestFilePathForAccount(acc *Account) string {
 	if m.db != nil {
 		aid := strings.TrimSpace(acc.Token.AccountID)
 		em := strings.TrimSpace(acc.Token.Email)
+		if !acc.HasRefreshToken() {
+			if em != "" {
+				return "db:" + em
+			}
+			if aid != "" {
+				return "db:" + aid
+			}
+			return "db:" + ingestSyntheticAccountID(ingestIdentitySeed(acc))
+		}
 		if aid != "" {
 			return "db:" + aid
 		}
 		if em != "" {
 			return "db:" + em
 		}
-		return "db:" + ingestSyntheticAccountID(acc.Token.RefreshToken)
+		return "db:" + ingestSyntheticAccountID(ingestIdentitySeed(acc))
 	}
 	base := sanitizeAuthFileBase(acc.Token.Email)
 	if base == "" {
 		base = sanitizeAuthFileBase(acc.Token.AccountID)
 	}
 	if base == "" {
-		base = ingestSyntheticAccountID(acc.Token.RefreshToken)
+		base = ingestSyntheticAccountID(ingestIdentitySeed(acc))
 	}
 	return filepath.Join(m.authDir, base+".json")
 }
 
-/**
- * IngestAccountsFromJSON 将 JSON 凭据写入号池：与磁盘 *.json / 数据库 upsert 一致，已存在同一路径（db:… 或文件路径）则更新 Token
- */
 func (m *Manager) IngestAccountsFromJSON(body []byte) (IngestResult, error) {
 	if m.db == nil && strings.TrimSpace(m.authDir) == "" {
 		return IngestResult{}, fmt.Errorf("未配置 auth-dir 且未启用数据库，无法导入")
@@ -164,6 +205,7 @@ func (m *Manager) IngestAccountsFromJSON(body []byte) (IngestResult, error) {
 		if aerr != nil {
 			res.Failed++
 			res.appendErr(fmt.Sprintf("#%d: %v", i+1, aerr))
+			log.Warnf("账号上传: 跳过第 %d/%d 条: %v", i+1, len(tokens), aerr)
 			continue
 		}
 		if m.db != nil {
@@ -177,6 +219,7 @@ func (m *Manager) IngestAccountsFromJSON(body []byte) (IngestResult, error) {
 			m.mu.Unlock()
 			m.enqueueSave(ex)
 			res.Updated++
+			log.Debugf("账号上传: 更新 ident=%s path=%s has_refresh_token=%t", ingestLogIdent(ex), ex.FilePath, ex.HasRefreshToken())
 		} else {
 			m.accounts = append(m.accounts, acc)
 			m.accountIndex[acc.FilePath] = acc
@@ -184,6 +227,7 @@ func (m *Manager) IngestAccountsFromJSON(body []byte) (IngestResult, error) {
 			m.mu.Unlock()
 			m.enqueueSave(acc)
 			res.Added++
+			log.Debugf("账号上传: 新增 ident=%s path=%s has_refresh_token=%t", ingestLogIdent(acc), acc.FilePath, acc.HasRefreshToken())
 		}
 	}
 	if res.Added+res.Updated > 0 {
@@ -192,5 +236,8 @@ func (m *Manager) IngestAccountsFromJSON(body []byte) (IngestResult, error) {
 	m.mu.RLock()
 	res.PoolTotal = len(m.accounts)
 	m.mu.RUnlock()
+	if res.Added+res.Updated+res.Failed > 0 {
+		log.Debugf("账号上传汇总: 新增=%d 更新=%d 失败=%d 号池合计=%d", res.Added, res.Updated, res.Failed, res.PoolTotal)
+	}
 	return res, nil
 }

@@ -452,7 +452,7 @@ func (m *Manager) LoadAccountsProgressive(ctx context.Context, batchSize int) er
 			}
 		}
 		if m.AccountCount() == 0 {
-			return fmt.Errorf("数据库中未找到有效账号")
+			log.Warnf("数据库中暂无有效账号，号池为空（可后续导入 JSON 或写入库）")
 		}
 		return nil
 	}
@@ -477,7 +477,8 @@ func (m *Manager) LoadAccountsProgressive(ctx context.Context, batchSize int) er
 		filePaths = append(filePaths, filepath.Join(authDir, entry.Name()))
 	}
 	if len(filePaths) == 0 {
-		return fmt.Errorf("在目录 %s 中未找到 .json 账号文件", authDir)
+		log.Warnf("在目录 %s 中未找到 .json 账号文件，号池为空", authDir)
+		return nil
 	}
 	for i := 0; i < len(filePaths); i += batchSize {
 		select {
@@ -496,7 +497,7 @@ func (m *Manager) LoadAccountsProgressive(ctx context.Context, batchSize int) er
 			added, m.AccountCount(), end, len(filePaths))
 	}
 	if m.AccountCount() == 0 {
-		return fmt.Errorf("在目录 %s 中未找到有效的账号文件", authDir)
+		log.Warnf("在目录 %s 中未解析出有效账号，号池为空", authDir)
 	}
 	return nil
 }
@@ -520,14 +521,14 @@ func (m *Manager) LoadAccounts() error {
 			return fmt.Errorf("加载数据库账号失败: %w", err)
 		}
 
-		if len(m.accounts) == 0 {
-			m.mu.Unlock()
-			return fmt.Errorf("数据库中未找到有效账号")
-		}
 		m.publishSnapshot()
 		n := len(m.accounts)
 		m.mu.Unlock()
-		log.Infof("共加载 %d 个 Codex 账号（%s）", n, m.dbDialect.String())
+		if n == 0 {
+			log.Warnf("数据库中暂无有效账号，号池为空（可后续导入 JSON 或写入库）")
+		} else {
+			log.Infof("共加载 %d 个 Codex 账号（%s）", n, m.dbDialect.String())
+		}
 		return nil
 	}
 	authDir := m.authDir
@@ -548,19 +549,27 @@ func (m *Manager) LoadAccounts() error {
 		filePaths = append(filePaths, filepath.Join(authDir, entry.Name()))
 	}
 	accounts := loadAccountsFromPathsParallel(filePaths)
-	if len(accounts) == 0 {
-		return fmt.Errorf("在目录 %s 中未找到有效的账号文件", authDir)
-	}
-	index := make(map[string]*Account, len(accounts))
-	for _, a := range accounts {
-		index[a.FilePath] = a
+	index := make(map[string]*Account)
+	if len(accounts) > 0 {
+		index = make(map[string]*Account, len(accounts))
+		for _, a := range accounts {
+			index[a.FilePath] = a
+		}
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.accounts = accounts
 	m.accountIndex = index
 	m.publishSnapshot()
-	log.Infof("共加载 %d 个 Codex 账号", len(accounts))
+	if len(accounts) == 0 {
+		if len(filePaths) == 0 {
+			log.Warnf("在目录 %s 中未找到 .json 账号文件，号池为空", authDir)
+		} else {
+			log.Warnf("在目录 %s 中未解析出有效账号，号池为空", authDir)
+		}
+	} else {
+		log.Infof("共加载 %d 个 Codex 账号", len(accounts))
+	}
 	return nil
 }
 
@@ -568,8 +577,12 @@ func (m *Manager) LoadAccounts() error {
  * accountFromTokenFile 由 TokenFile 构造账号（与磁盘 JSON、导入 DB 共用）
  */
 func accountFromTokenFile(tf *TokenFile, logicalPath string) (*Account, error) {
-	if tf.RefreshToken == "" {
-		return nil, fmt.Errorf("缺少 refresh_token")
+	rt := strings.TrimSpace(tf.RefreshToken)
+	if rt == "" {
+		rt = strings.TrimSpace(tf.RK)
+	}
+	if rt == "" && strings.TrimSpace(tf.AccessToken) == "" && strings.TrimSpace(tf.IDToken) == "" {
+		return nil, fmt.Errorf("缺少 refresh_token/rk、access_token 与 id_token，至少需一项")
 	}
 	accountID := tf.AccountID
 	email := tf.Email
@@ -589,7 +602,7 @@ func accountFromTokenFile(tf *TokenFile, logicalPath string) (*Account, error) {
 		Token: TokenData{
 			IDToken:      tf.IDToken,
 			AccessToken:  tf.AccessToken,
-			RefreshToken: tf.RefreshToken,
+			RefreshToken: rt,
 			AccountID:    accountID,
 			Email:        email,
 			Expire:       tf.Expire,
@@ -620,7 +633,7 @@ func loadAccountFromFile(filePath string) (*Account, error) {
 }
 
 func accountFromDBRow(id int64, accountID, email, idToken, accessToken, refreshToken, expire, planType sql.NullString, lastRefresh sql.NullTime, status sql.NullInt32, cooldownUntil sql.NullTime, disableReason sql.NullString, lastUsedAt sql.NullTime) (*Account, bool) {
-	if refreshToken.String == "" {
+	if strings.TrimSpace(refreshToken.String) == "" && strings.TrimSpace(accessToken.String) == "" && strings.TrimSpace(idToken.String) == "" {
 		return nil, false
 	}
 	key := "db:" + accountID.String
@@ -1537,6 +1550,9 @@ func (m *Manager) afterRefreshValidateQuota(ctx context.Context, qc *QuotaChecke
 	if qc == nil || acc == nil {
 		return true
 	}
+	if !acc.HasRefreshToken() {
+		return true
+	}
 	return m.applyPostRefreshQuotaOutcome(ctx, qc, acc, false)
 }
 
@@ -2159,14 +2175,14 @@ func (m *Manager) recoverAuth401Once(ctx context.Context, acc *Account, qc *Quot
 	defer acc.refreshing.Store(0)
 
 	acc.mu.RLock()
-	refreshToken := acc.Token.RefreshToken
+	refreshToken := strings.TrimSpace(acc.Token.RefreshToken)
 	acc.mu.RUnlock()
 
 	if refreshToken == "" {
-		log.Warnf("账号 [%s] 无 refresh_token，禁用凭据", email)
-		m.DisableAccountByRenamingFile(acc, ReasonAuth401Disabled)
-		out.Status = Auth401RecoverDisabled
-		out.ReasonCode = ReasonAuth401Disabled
+		log.Warnf("账号 [%s] 无 refresh_token（空或 null），401 触发已从号池删除", email)
+		m.RemoveAccount(acc, ReasonAuth401NoRefreshToken)
+		out.Status = Auth401RecoverRemoved
+		out.ReasonCode = ReasonAuth401NoRefreshToken
 		out.Detail = "missing refresh_token"
 		return out
 	}
@@ -2286,6 +2302,9 @@ func (m *Manager) HandleAuth401(acc *Account, qc *QuotaChecker) Auth401RecoverRe
  */
 func (m *Manager) ScheduleUpstream429Recovery(_ context.Context, acc *Account, qc *QuotaChecker) {
 	if qc == nil || acc == nil {
+		return
+	}
+	if !acc.HasRefreshToken() {
 		return
 	}
 	if !acc.upstream429Recovering.CompareAndSwap(0, 1) {

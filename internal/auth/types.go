@@ -48,11 +48,13 @@ type TokenFile struct {
 	IDToken      string `json:"id_token"`
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
-	AccountID    string `json:"account_id"`
-	LastRefresh  string `json:"last_refresh"`
-	Email        string `json:"email"`
-	Type         string `json:"type"`
-	Expire       string `json:"expired"`
+	/* RK 与 refresh_token 等价；JSON 中 null 与省略 unmarsh 后均为空串 */
+	RK          string `json:"rk"`
+	AccountID   string `json:"account_id"`
+	LastRefresh string `json:"last_refresh"`
+	Email       string `json:"email"`
+	Type        string `json:"type"`
+	Expire      string `json:"expired"`
 }
 
 /**
@@ -128,6 +130,8 @@ const (
 const (
 	ReasonNone    = ""
 	ReasonAuth401 = "auth_401"
+	/* ReasonAuth401NoRefreshToken 上游 401 且无 refresh_token，已从号池删除 */
+	ReasonAuth401NoRefreshToken = "auth_401_no_refresh_token"
 	/* ReasonAuth401Disabled 上游 401 且刷新/额度复核均失败，凭据文件已重命名禁用 */
 	ReasonAuth401Disabled    = "auth_401_disabled"
 	ReasonAuth403            = "auth_403"
@@ -252,6 +256,18 @@ func (a *Account) GetAccessToken() string {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.Token.AccessToken
+}
+
+/**
+ * HasRefreshToken 是否具备非空的 refresh_token（含上传 JSON 中 rk→refresh_token 合并后；字段为 null 或 "" 均视为无 rk）
+ */
+func (a *Account) HasRefreshToken() bool {
+	if a == nil {
+		return false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return strings.TrimSpace(a.Token.RefreshToken) != ""
 }
 
 /**
