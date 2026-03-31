@@ -10,8 +10,7 @@ permissions:
   contents: write
   packages: write
   pull-requests: write
-  # BuildKit type=gha 缓存走 Actions Cache API；不显式授权时 actions 为 none，缓存无法读写，表现为每次全量构建
-  actions: read
+  # BuildKit type=gha 缓存走 Actions Cache API；write 含读权限；不显式授权时 actions 为 none
   actions: write
 
 jobs:
