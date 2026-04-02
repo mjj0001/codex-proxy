@@ -12,6 +12,7 @@ config.yaml
 *.dll
 *.so
 *.dylib
+app
 
 # 参考项目
 CLIProxyAPIPlus/

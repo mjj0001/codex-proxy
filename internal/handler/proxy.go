@@ -148,7 +148,12 @@ func (h *ProxyHandler) RegisterRoutes(r *fasthttprouter.Router) {
 		apiResponses = h.authMiddleware(h.handleResponses)
 	}
 	r.POST("/v1/responses", apiResponses)
-	// r.POST("/v1/responses/compact", ... ) 原接口暂不支持
+
+	apiResponsesCompact := h.handleResponsesCompact
+	if len(h.apiKeys) > 0 {
+		apiResponsesCompact = h.authMiddleware(h.handleResponsesCompact)
+	}
+	r.POST("/v1/responses/compact", apiResponsesCompact)
 
 	apiMessages := h.handleMessages
 	if len(h.apiKeys) > 0 {
