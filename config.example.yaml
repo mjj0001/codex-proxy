@@ -163,6 +163,13 @@ startup-async-load: true
 # 连接池保活 ping 间隔（秒）
 # keepalive-interval: 60
 
+# 是否允许模型名使用 -fast / -1m 子参数。
+# 关闭后：
+# 1) 请求里显式写了对应后缀会直接返回 400
+# 2) /v1/models 不再枚举对应变体
+# enable-model-suffix-fast: true
+# enable-model-suffix-1m: true
+
 # 空返回时最多再重试次数
 # empty-retry-max: 2
 

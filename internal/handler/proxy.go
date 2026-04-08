@@ -20,6 +20,7 @@ import (
 
 	"codex-proxy/internal/auth"
 	"codex-proxy/internal/executor"
+	"codex-proxy/internal/thinking"
 
 	fasthttprouter "github.com/fasthttp/router"
 	"github.com/fasthttp/websocket"
@@ -76,6 +77,8 @@ type ProxyHandler struct {
 	indexHTML            []byte
 	emptyRetryMax        int
 	debugUpstreamStream  bool     /* 配置 debug-upstream-stream：打印上游 SSE 原文 */
+	enableModelFast      bool     /* 是否允许模型名携带 -fast */
+	enableModel1M        bool     /* 是否允许模型名携带 -1m */
 	auth401RecoverTracks sync.Map /* key: filePath, value: *auth401RecoverTrack */
 	/* retryCfg 在首请求时构建一次，避免每条对话重复分配闭包与 RetryConfig */
 	retryCfgOnce sync.Once
@@ -101,7 +104,7 @@ type auth401RecoverTrack struct {
  * @param debugUpstreamStream - 是否 Info 打印上游 Codex SSE 原文（对应配置 debug-upstream-stream）
  * @returns *ProxyHandler - 代理处理器实例
  */
-func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []string, maxRetry int, enableHealthyRetry bool, proxyURL string, baseURL string, enableHTTP2 bool, backendDomain string, backendResolveAddress string, quotaCheckConcurrency int, quotaCheckCacheTTLSec int, quotaChecker *auth.QuotaChecker, quotaPrecheck bool, emptyRetryMax int, debugUpstreamStream bool, indexHTML []byte) *ProxyHandler {
+func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []string, maxRetry int, enableHealthyRetry bool, proxyURL string, baseURL string, enableHTTP2 bool, backendDomain string, backendResolveAddress string, quotaCheckConcurrency int, quotaCheckCacheTTLSec int, quotaChecker *auth.QuotaChecker, quotaPrecheck bool, emptyRetryMax int, debugUpstreamStream bool, enableModelFast bool, enableModel1M bool, indexHTML []byte) *ProxyHandler {
 	if maxRetry < 0 {
 		maxRetry = 0
 	}
@@ -122,6 +125,8 @@ func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []s
 		indexHTML:           indexHTML,
 		emptyRetryMax:       emptyRetryMax,
 		debugUpstreamStream: debugUpstreamStream,
+		enableModelFast:     enableModelFast,
+		enableModel1M:       enableModel1M,
 	}
 }
 
@@ -281,14 +286,18 @@ var modelList = []modelListEntry{
 	{base: "gpt-5.4-mini", suffixes: []string{"low", "medium", "high", "xhigh", "none", "auto"}},
 }
 
-func expandModelSubvariantIDs(id string) []string {
-	return []string{
-		id,
-		id + "-1m",
-		id + "-fast",
-		id + "-1m-fast",
-		id + "-fast-1m",
+func expandModelSubvariantIDs(id string, enableFast bool, enable1M bool) []string {
+	out := []string{id}
+	if enable1M {
+		out = append(out, id+"-1m")
 	}
+	if enableFast {
+		out = append(out, id+"-fast")
+	}
+	if enableFast && enable1M {
+		out = append(out, id+"-1m-fast", id+"-fast-1m")
+	}
+	return out
 }
 
 func (h *ProxyHandler) handleModels(ctx *fasthttp.RequestCtx) {
@@ -300,7 +309,7 @@ func (h *ProxyHandler) handleModels(ctx *fasthttp.RequestCtx) {
 			ids = append(ids, e.base+"-"+s)
 		}
 		for _, id := range ids {
-			for _, mid := range expandModelSubvariantIDs(id) {
+			for _, mid := range expandModelSubvariantIDs(id, h.enableModelFast, h.enableModel1M) {
 				models = append(models, map[string]interface{}{"id": mid, "object": "model", "owned_by": "openai"})
 			}
 		}
@@ -310,6 +319,17 @@ func (h *ProxyHandler) handleModels(ctx *fasthttp.RequestCtx) {
 		"object": "list",
 		"data":   models,
 	})
+}
+
+func (h *ProxyHandler) validateModelSuffixOptions(model string) error {
+	parsed := thinking.ParseModelSuffix(model)
+	if parsed.IsFast && !h.enableModelFast {
+		return fmt.Errorf("模型后缀 -fast 已禁用")
+	}
+	if parsed.Is1M && !h.enableModel1M {
+		return fmt.Errorf("模型后缀 -1m 已禁用")
+	}
+	return nil
 }
 
 /**
@@ -563,6 +583,10 @@ func (h *ProxyHandler) handleChatCompletions(ctx *fasthttp.RequestCtx) {
 	model := gjson.GetBytes(body, "model").String()
 	if model == "" {
 		writeJSON(ctx, fasthttp.StatusBadRequest, map[string]any{"error": map[string]any{"message": "缺少 model 字段", "type": "invalid_request_error"}})
+		return
+	}
+	if err := h.validateModelSuffixOptions(model); err != nil {
+		writeJSON(ctx, fasthttp.StatusBadRequest, map[string]any{"error": map[string]any{"message": err.Error(), "type": "invalid_request_error"}})
 		return
 	}
 	stream := gjson.GetBytes(body, "stream").Bool()
@@ -870,6 +894,10 @@ func (h *ProxyHandler) handleResponses(ctx *fasthttp.RequestCtx) {
 		sendError(ctx, fasthttp.StatusBadRequest, "缺少 model 字段", "invalid_request_error")
 		return
 	}
+	if err := h.validateModelSuffixOptions(model); err != nil {
+		sendError(ctx, fasthttp.StatusBadRequest, err.Error(), "invalid_request_error")
+		return
+	}
 	stream := gjson.GetBytes(body, "stream").Bool()
 
 	log.Debugf("收到 Responses 请求: model=%s, stream=%v", model, stream)
@@ -942,6 +970,10 @@ func (h *ProxyHandler) handleResponsesWS(ctx *fasthttp.RequestCtx) {
 				model := gjson.GetBytes(requestBody, "model").String()
 				if model == "" {
 					h.writeWSError(conn, "invalid_request_error", "缺少 model 字段")
+					continue
+				}
+				if err := h.validateModelSuffixOptions(model); err != nil {
+					h.writeWSError(conn, "invalid_request_error", err.Error())
 					continue
 				}
 
@@ -1102,6 +1134,10 @@ func (h *ProxyHandler) handleResponsesCompact(ctx *fasthttp.RequestCtx) {
 	model := gjson.GetBytes(body, "model").String()
 	if model == "" {
 		sendError(ctx, fasthttp.StatusBadRequest, "缺少 model 字段", "invalid_request_error")
+		return
+	}
+	if err := h.validateModelSuffixOptions(model); err != nil {
+		sendError(ctx, fasthttp.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
 	}
 	stream := gjson.GetBytes(body, "stream").Bool()

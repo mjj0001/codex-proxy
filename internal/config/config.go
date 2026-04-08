@@ -115,6 +115,10 @@ type Config struct {
 	RefreshBatchSize        int      `yaml:"refresh-batch-size"`
 	Accounts                []string `yaml:"accounts"`
 	APIKeys                 []string `yaml:"api-keys"`
+	/* EnableModelSuffixFast 控制是否允许模型名中的 -fast 子参数，并同步影响 /v1/models 枚举 */
+	EnableModelSuffixFast bool `yaml:"enable-model-suffix-fast"`
+	/* EnableModelSuffix1M 控制是否允许模型名中的 -1m 子参数，并同步影响 /v1/models 枚举 */
+	EnableModelSuffix1M bool `yaml:"enable-model-suffix-1m"`
 
 	/* 入站 HTTP/2 (h2c) 等 */
 	EnableListenH2C            bool `yaml:"enable-listen-h2c"`
@@ -189,6 +193,8 @@ func LoadConfig(path string) (*Config, error) {
 		EmptyRetryMax:                    2,
 		Selector:                         "round-robin",
 		RefreshBatchSize:                 0,
+		EnableModelSuffixFast:            true,
+		EnableModelSuffix1M:              true,
 		EnableListenH2C:                  true,
 		ListenReadHeaderTimeoutSec:       60,
 		ListenIdleTimeoutSec:             180,

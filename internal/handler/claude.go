@@ -109,6 +109,10 @@ func (h *ProxyHandler) handleMessages(ctx *fasthttp.RequestCtx) {
 		sendClaudeError(ctx, fasthttp.StatusBadRequest, "invalid_request_error", "缺少 model 字段")
 		return
 	}
+	if err := h.validateModelSuffixOptions(model); err != nil {
+		sendClaudeError(ctx, fasthttp.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
 
 	log.Debugf("收到 Claude Messages 请求: model=%s, stream=%v", model, stream)
 

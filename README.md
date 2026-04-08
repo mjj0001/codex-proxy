@@ -160,6 +160,8 @@ curl http://localhost:8080/v1/messages \
 - **`-fast`**：上游 `service_tier` 固定为 `fast`（快速队列）。
 - **`-1m`**：上游固定写入大上下文相关字段：`model_context_window = 1047576`，`model_auto_compact_token_limit = 105197`。
 
+可通过配置项 `enable-model-suffix-fast`、`enable-model-suffix-1m` 分别控制这两个子参数；关闭后，请求中使用对应后缀会返回 `400`，且 `/v1/models` 不再枚举对应变体。
+
 **子参数与请求体的关系**：只要在模型名里写了对应子参数，代理会**强制覆盖**上游请求中的同名字段，**不会**再采用客户端在 JSON 里传的值。未写该子参数时，这些字段若客户端有传则**透传**。
 
 - 思考级别写在模型名后缀（如 `gpt-5.4-high`）时，同样**覆盖**请求体里的 `reasoning_effort` / `variant` / `reasoning.effort`（以模型名为准）。
