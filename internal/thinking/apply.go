@@ -56,11 +56,7 @@ func ApplyThinking(body []byte, model string) ([]byte, string) {
 		}
 	}
 	if parsed.IsFast {
-		body, _ = sjson.SetBytes(body, "service_tier", "fast")
-	}
-	if parsed.Is1M {
-		body, _ = sjson.SetBytes(body, "model_context_window", 1047576)
-		body, _ = sjson.SetBytes(body, "model_auto_compact_token_limit", 105197)
+		body, _ = sjson.SetBytes(body, "service_tier", "priority")
 	}
 
 	return body, baseModel

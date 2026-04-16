@@ -339,12 +339,6 @@ func ConvertOpenAIRequestToCodex(modelName string, rawJSON []byte, stream bool) 
 			out, _ = sjson.Set(out, "service_tier", st)
 		}
 	}
-	if v := gjson.GetBytes(rawJSON, "model_context_window"); v.Exists() {
-		out, _ = sjson.SetRaw(out, "model_context_window", v.Raw)
-	}
-	if v := gjson.GetBytes(rawJSON, "model_auto_compact_token_limit"); v.Exists() {
-		out, _ = sjson.SetRaw(out, "model_auto_compact_token_limit", v.Raw)
-	}
 
 	out, _ = sjson.Set(out, "store", false)
 	outBytes := ensureInputContainsJSON([]byte(out))
