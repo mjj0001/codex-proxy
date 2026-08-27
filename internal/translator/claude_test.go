@@ -31,6 +31,12 @@ func TestConvertClaudeRequestToOpenAIMapsClaudeThinkingEffort(t *testing.T) {
 			wantEffort: "high",
 			wantStream: false,
 		},
+		{
+			name:       "thinking enabled uses output config effort",
+			body:       `{"model":"claude-opus-5","messages":[{"role":"user","content":"hello"}],"thinking":{"type":"enabled"},"output_config":{"effort":"max"}}`,
+			wantEffort: "max",
+			wantStream: false,
+		},
 	}
 
 	for _, tt := range tests {

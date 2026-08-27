@@ -435,6 +435,7 @@ var modelList = []modelListEntry{
 	},
 	newModelListEntry("gpt-5.6-terra", []string{"low", "medium", "high", "xhigh", "max", "ultra", "auto"}),
 	newModelListEntry("gpt-5.6-luna", []string{"low", "medium", "high", "xhigh", "max", "ultra", "auto"}),
+	newModelListEntry("gpt-reserve", []string{"low", "medium", "high", "xhigh", "max", "ultra", "auto"}),
 	{
 		base:     "codex-auto-review",
 		baseOnly: true,

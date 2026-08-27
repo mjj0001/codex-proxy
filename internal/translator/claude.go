@@ -84,13 +84,16 @@ func claudeThinkingEffort(root gjson.Result) string {
 		if budget := thinking.Get("budget_tokens"); budget.Exists() {
 			return claudeThinkingBudgetToEffort(budget.Int())
 		}
-		if thinkingType == "enabled" {
-			return "medium"
-		}
 	}
 
 	if effort := claudeEffortFromResult(root, "output_config.effort"); effort != "" {
 		return effort
+	}
+
+	if thinking := root.Get("thinking"); thinking.Exists() {
+		if claudeEffortFromResult(root, "thinking.type") == "enabled" {
+			return "medium"
+		}
 	}
 	return ""
 }

@@ -188,7 +188,8 @@ curl http://localhost:8080/v1/messages \
 | `gpt-5.5` | low, medium, high, xhigh, none, auto | `gpt-5.5`、`gpt-5.5-xhigh-fast`、`gpt-5.5-xhigh-1m-fast`、`gpt-5.5-auto` |
 | `gpt-5.6-sol` | low, medium, high, xhigh, max, ultra, auto | `gpt-5.6-sol`、`gpt-5.6-sol-max`、`gpt-5.6-sol-ultra` |
 | `gpt-5.6-terra` | low, medium, high, xhigh, max, ultra, auto | `gpt-5.6-terra`、`gpt-5.6-terra-max`、`gpt-5.6-terra-ultra` |
-| `gpt-5.6-luna` | low, medium, high, xhigh, max, auto | `gpt-5.6-luna`、`gpt-5.6-luna-max` |
+| `gpt-5.6-luna` | low, medium, high, xhigh, max, ultra, auto | `gpt-5.6-luna`、`gpt-5.6-luna-max`、`gpt-5.6-luna-ultra` |
+| `gpt-reserve` | low, medium, high, xhigh, max, ultra, auto | `gpt-reserve`、`gpt-reserve-max`、`gpt-reserve-ultra` |
 
 大上下文示例：`gpt-5.4-1m`、`gpt-5.4-high-1m-fast`、`gpt-5.4-xhigh-1m-fast`。
 

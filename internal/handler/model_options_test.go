@@ -47,6 +47,12 @@ func TestHandleModelsIncludesRestrictedBaseModelsOnly(t *testing.T) {
 	var ctx fasthttp.RequestCtx
 	h.handleModels(&ctx)
 
+	if got := gjson.GetBytes(ctx.Response.Body(), `data.#(id=="gpt-reserve").id`).String(); got != "gpt-reserve" {
+		t.Fatalf("gpt-reserve is missing from model list")
+	}
+	if got := gjson.GetBytes(ctx.Response.Body(), `data.#(id=="gpt-reserve-ultra").id`).String(); got != "gpt-reserve-ultra" {
+		t.Fatalf("gpt-reserve-ultra is missing from model list")
+	}
 	if got := gjson.GetBytes(ctx.Response.Body(), `data.#(id=="gpt-5.3-codex-spark").id`).String(); got != "gpt-5.3-codex-spark" {
 		t.Fatalf("gpt-5.3-codex-spark is missing from model list")
 	}
