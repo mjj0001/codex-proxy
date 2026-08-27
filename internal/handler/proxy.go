@@ -561,12 +561,16 @@ func parseModelRequestOptions(model string) modelRequestOptions {
 	return result
 }
 
-func hasRequestField(body []byte, path string) bool {
-	return len(body) > 0 && gjson.ValidBytes(body) && gjson.GetBytes(body, path).Exists()
+func hasRequestField(root gjson.Result, path string) bool {
+	return root.Exists() && root.Get(path).Exists()
 }
 
 func (h *ProxyHandler) validateModelRequestOptions(model string, body []byte) error {
 	options := parseModelRequestOptions(model)
+	var root gjson.Result
+	if len(body) > 0 && gjson.ValidBytes(body) {
+		root = gjson.ParseBytes(body)
+	}
 	if options.isFast && !h.enableModelFast {
 		return fmt.Errorf("模型后缀 -fast 已禁用")
 	}
@@ -596,21 +600,21 @@ func (h *ProxyHandler) validateModelRequestOptions(model string, body []byte) er
 
 	if options.isImage {
 		for _, path := range []string{"reasoning", "reasoning.effort", "reasoning_effort", "variant", "service_tier", "speed", "thinking", "output_config.effort"} {
-			if hasRequestField(body, path) {
+			if hasRequestField(root, path) {
 				return fmt.Errorf("-image 模式不能传递 %s 参数", path)
 			}
 		}
 	}
 	if options.entry != nil && options.entry.baseOnly {
 		for _, path := range []string{"reasoning", "reasoning.effort", "reasoning_effort", "variant", "thinking", "output_config.effort"} {
-			if hasRequestField(body, path) {
+			if hasRequestField(root, path) {
 				return fmt.Errorf("模型 %s 不支持 %s 参数", options.entry.base, path)
 			}
 		}
-		if serviceTier := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "service_tier").String())); serviceTier == "fast" || serviceTier == "priority" {
+		if serviceTier := strings.ToLower(strings.TrimSpace(root.Get("service_tier").String())); serviceTier == "fast" || serviceTier == "priority" {
 			return fmt.Errorf("模型 %s 不支持 fast 参数", options.entry.base)
 		}
-		if speed := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "speed").String())); speed == "fast" {
+		if speed := strings.ToLower(strings.TrimSpace(root.Get("speed").String())); speed == "fast" {
 			return fmt.Errorf("模型 %s 不支持 fast 参数", options.entry.base)
 		}
 	}

@@ -2,7 +2,6 @@ package executor
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -73,49 +72,6 @@ type CodexResponsesMeta struct {
 	ResponseHeader http.Header /* 最近一次上游响应头快照（turn-state 等回传头来源） */
 }
 
-/* prefixThenRestCloser 首读已拉取的字节 + 剩余 Body，供在返回给客户端前探测 GOAWAY 后仍能透传已读数据 */
-type prefixThenRestCloser struct {
-	prefix []byte
-	off    int
-	rest   io.ReadCloser
-}
-
-func (p *prefixThenRestCloser) Read(b []byte) (int, error) {
-	if p.off < len(p.prefix) {
-		n := copy(b, p.prefix[p.off:])
-		p.off += n
-		return n, nil
-	}
-	if p.rest == nil {
-		return 0, io.EOF
-	}
-	return p.rest.Read(b)
-}
-
-func (p *prefixThenRestCloser) Close() error {
-	if p.rest == nil {
-		return nil
-	}
-	err := p.rest.Close()
-	p.rest = nil
-	return err
-}
-
-/* bufioTailCloser 将 bufio.Reader 与底层 Body 绑定 Close，供首读探测后继续读剩余流 */
-type bufioTailCloser struct {
-	r *bufio.Reader
-	c io.Closer
-}
-
-func (b *bufioTailCloser) Read(p []byte) (int, error) { return b.r.Read(p) }
-
-func (b *bufioTailCloser) Close() error {
-	if b.c != nil {
-		return b.c.Close()
-	}
-	return nil
-}
-
 // upstreamStreamLogMaxBytes 单条日志中上游 SSE 行/块的最大字节（超出截断，避免撑爆日志）
 const upstreamStreamLogMaxBytes = 65536
 
@@ -145,8 +101,8 @@ func codexStreamPumpRounds(maxRetry int) int {
 	return n
 }
 
-// openCodexResponsesBody 与 OpenCodexResponsesStream 相同：选号、sendWithRetry、首读探测空体/可重试读错并换号。
-// Claude 原始流等非 Pump 路径也经此打开，避免 200 + 空 body 导致客户端 SSE 体完全无字节。
+// openCodexResponsesBody 完成选号、sendWithRetry 和上游 body 打开；不在此处预读 SSE，避免拖慢正常流首包。
+// Claude 原始流等非 Pump 路径也经此打开。
 // fps 为本请求的指纹与粘性状态（可为 nil）。
 func (e *Executor) openCodexResponsesBody(ctx context.Context, rc RetryConfig, requestBody []byte, model string, fps *RequestsFingerprint) (bodyRC io.ReadCloser, meta CodexResponsesMeta, err error) {
 	convertStart := time.Now()
@@ -186,77 +142,13 @@ func (e *Executor) openCodexResponsesBody(ctx context.Context, rc RetryConfig, r
 			return nil, meta, serr
 		}
 
-		/* 行缓冲探测：若首段 SSE 仅为额度用尽（如 usage_limit_reached），换号且不把错误字节交给 PumpRawSSE 透传 */
-		br := bufio.NewReader(httpResp.Body)
-		var prelude bytes.Buffer
-		const maxProbeLines = 96
-		const maxProbeBytes = 128 * 1024
-		hitQuota := false
-		var probeErr error
-		for i := 0; i < maxProbeLines && prelude.Len() < maxProbeBytes; i++ {
-			line, rerr := br.ReadBytes('\n')
-			if len(line) > 0 {
-				prelude.Write(line)
-			}
-			if upstreamPrefixIndicatesUsageQuotaExceeded(prelude.Bytes()) {
-				hitQuota = true
-				probeErr = rerr
-				break
-			}
-			if rerr != nil {
-				probeErr = rerr
-				break
-			}
-		}
-
-		if hitQuota && round+1 < readRounds {
-			_ = httpResp.Body.Close()
-			acc.RecordFailure()
-			handleAccountError(acc, 429, codexQuotaPayloadForCooldown(prelude.Bytes()))
-			if rc.On429RecoveryFn != nil {
-				go rc.On429RecoveryFn(context.Background(), acc)
-			}
-			excluded[acc.FilePath] = true
-			log.Warnf("responses-stream 上游首段为额度用尽类错误，换号重试 (%d/%d) account=%s", round+1, readRounds, acc.GetEmail())
-			continue
-		}
-
 		meta.SendDur = time.Since(sendStart)
-
-		if probeErr != nil && probeErr != io.EOF {
-			_ = httpResp.Body.Close()
-			acc.RecordFailure()
-			if isRetryableUpstreamReadErr(probeErr) && round+1 < readRounds {
-				excluded[acc.FilePath] = true
-				log.Warnf("responses-stream 首读失败，换号/重建连接重试 (%d/%d) account=%s: %v", round+1, readRounds, acc.GetEmail(), wrapReadErr(probeErr))
-				continue
-			}
-			return nil, meta, fmt.Errorf("读取上游流失败: %w", wrapReadErr(probeErr))
-		}
-
-		pr := prelude.Bytes()
-		if len(pr) == 0 && probeErr == io.EOF {
-			_ = httpResp.Body.Close()
-			acc.RecordFailure()
-			if round+1 < readRounds {
-				excluded[acc.FilePath] = true
-				log.Warnf("responses-stream 上游立即 EOF，换号重试 (%d/%d) account=%s", round+1, readRounds, acc.GetEmail())
-				continue
-			}
-			return nil, meta, fmt.Errorf("读取上游流失败: 空响应")
-		}
-
-		tail := &bufioTailCloser{r: br, c: httpResp.Body}
-		var bodyOut io.ReadCloser = tail
-		if len(pr) > 0 {
-			bodyOut = &prefixThenRestCloser{prefix: append([]byte(nil), pr...), rest: tail}
-		}
 
 		meta.Account = acc
 		meta.Attempts = att
 		meta.ReverseTools = translator.BuildReverseToolNameMap(requestBody)
 		meta.ResponseHeader = httpResp.Header.Clone()
-		return bodyOut, meta, nil
+		return httpResp.Body, meta, nil
 	}
 	meta.SendDur = time.Since(sendStart)
 	return nil, meta, fmt.Errorf("读取上游流失败")
@@ -270,8 +162,6 @@ func (e *Executor) openCodexResponsesBodyExcl(ctx context.Context, rc RetryConfi
 	return e.openCodexResponsesBody(ctx, rc, requestBody, model, fps)
 }
 
-// OpenCodexResponsesStream 完成选号、重试与首包前的 HTTP 往返；调用方在写入客户端 SSE 头后再 Pump。
-// 在返回前做一次首读：若立即遇 GOAWAY 等可重试错误则关连接换号重来，减少「已 200 后 pump 才断」的失败率。
 // UpstreamBody 返回当前上游响应体，由调用方在读完后 Close（与 PumpChatCompletion 的 defer 语义一致）。
 func (s *CodexResponsesStream) UpstreamBody() io.ReadCloser {
 	if s == nil {

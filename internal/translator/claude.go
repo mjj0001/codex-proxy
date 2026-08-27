@@ -35,6 +35,66 @@ var (
 	claudeToolUseIDCounter   uint64
 )
 
+func claudeEffortFromResult(root gjson.Result, path string) string {
+	if value := strings.ToLower(strings.TrimSpace(root.Get(path).String())); value != "" {
+		return value
+	}
+	return ""
+}
+
+// Claude 的 thinking 结构用 budget_tokens 表达强度，这里压成 reasoning.effort。
+func claudeThinkingBudgetToEffort(budget int64) string {
+	switch {
+	case budget <= 0:
+		return "none"
+	case budget <= 512:
+		return "auto"
+	case budget <= 1024:
+		return "low"
+	case budget <= 8192:
+		return "medium"
+	case budget <= 24576:
+		return "high"
+	case budget <= 32768:
+		return "xhigh"
+	default:
+		return "max"
+	}
+}
+
+func claudeThinkingEffort(root gjson.Result) string {
+	if !root.Exists() {
+		return ""
+	}
+
+	for _, path := range []string{"reasoning.effort", "reasoning_effort", "variant"} {
+		if effort := claudeEffortFromResult(root, path); effort != "" {
+			return effort
+		}
+	}
+
+	if thinking := root.Get("thinking"); thinking.Exists() {
+		thinkingType := claudeEffortFromResult(root, "thinking.type")
+		if thinkingType == "disabled" {
+			return "none"
+		}
+		if effort := claudeEffortFromResult(root, "thinking.effort"); effort != "" {
+			return effort
+		}
+		if budget := thinking.Get("budget_tokens"); budget.Exists() {
+			return claudeThinkingBudgetToEffort(budget.Int())
+		}
+		if thinkingType == "enabled" {
+			return "medium"
+		}
+	}
+
+	if effort := claudeEffortFromResult(root, "output_config.effort"); effort != "" {
+		return effort
+	}
+	return ""
+}
+
 /**
  * sanitizeClaudeToolID 确保 tool_use ID 符合 Claude 的正则要求
  * 将不符合规范的字符替换为 '_'，空结果使用生成的备用值
@@ -99,35 +159,40 @@ func claudeUsageReasoningTokens(usage gjson.Result) int64 {
  */
 func ConvertClaudeRequestToOpenAI(claudeBody []byte) ([]byte, string, bool) {
 	out := `{}`
+	root := gjson.ParseBytes(claudeBody)
 
 	/* 模型名 */
-	model := gjson.GetBytes(claudeBody, "model").String()
+	model := root.Get("model").String()
 	out, _ = sjson.Set(out, "model", model)
 
 	/* 流式标志 */
-	stream := gjson.GetBytes(claudeBody, "stream").Bool()
+	stream := root.Get("stream").Bool()
 	out, _ = sjson.Set(out, "stream", stream)
 
 	/* max_tokens */
-	if v := gjson.GetBytes(claudeBody, "max_tokens"); v.Exists() {
+	if v := root.Get("max_tokens"); v.Exists() {
 		out, _ = sjson.Set(out, "max_tokens", v.Int())
 	}
 
 	/* temperature */
-	if v := gjson.GetBytes(claudeBody, "temperature"); v.Exists() {
+	if v := root.Get("temperature"); v.Exists() {
 		out, _ = sjson.Set(out, "temperature", v.Float())
 	}
 
 	/* top_p */
-	if v := gjson.GetBytes(claudeBody, "top_p"); v.Exists() {
+	if v := root.Get("top_p"); v.Exists() {
 		out, _ = sjson.Set(out, "top_p", v.Float())
+	}
+
+	if effort := claudeThinkingEffort(root); effort != "" {
+		out, _ = sjson.Set(out, "reasoning.effort", effort)
 	}
 
 	/* 构建 messages 数组 */
 	out, _ = sjson.SetRaw(out, "messages", `[]`)
 
 	/* system → messages[0] role=system */
-	if sys := gjson.GetBytes(claudeBody, "system"); sys.Exists() {
+	if sys := root.Get("system"); sys.Exists() {
 		sysMsg := `{}`
 		sysMsg, _ = sjson.Set(sysMsg, "role", "system")
 		if sys.Type == gjson.String {
@@ -146,7 +211,7 @@ func ConvertClaudeRequestToOpenAI(claudeBody []byte) ([]byte, string, bool) {
 	}
 
 	/* 转换 messages */
-	messages := gjson.GetBytes(claudeBody, "messages")
+	messages := root.Get("messages")
 	if messages.IsArray() {
 		for _, m := range messages.Array() {
 			role := m.Get("role").String()
@@ -257,7 +322,7 @@ func ConvertClaudeRequestToOpenAI(claudeBody []byte) ([]byte, string, bool) {
 	}
 
 	/* 转换 tools：Claude 格式 → OpenAI 格式 */
-	if tools := gjson.GetBytes(claudeBody, "tools"); tools.IsArray() && len(tools.Array()) > 0 {
+	if tools := root.Get("tools"); tools.IsArray() && len(tools.Array()) > 0 {
 		out, _ = sjson.SetRaw(out, "tools", `[]`)
 		for _, t := range tools.Array() {
 			tool := `{}`
@@ -274,7 +339,7 @@ func ConvertClaudeRequestToOpenAI(claudeBody []byte) ([]byte, string, bool) {
 	}
 
 	/* tool_choice */
-	if tc := gjson.GetBytes(claudeBody, "tool_choice"); tc.Exists() {
+	if tc := root.Get("tool_choice"); tc.Exists() {
 		tcType := tc.Get("type").String()
 		switch tcType {
 		case "auto":
